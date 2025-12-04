@@ -1,27 +1,26 @@
 """This module validates the model prediction quality using COCO evaluation"""
 
 import json
+import multiprocessing as mp
 import shutil
 from dataclasses import asdict
 from pathlib import Path
 
+import PIL.Image
 import torch as th
 import tqdm
+from torchvision.transforms import v2
 
-import coco_evaluation_utilities
-import configuration
-import database_manager as dbm
-import datasets
-import datatypes as dt
-import image_utilities as image_utils
-import locations
-import models
-import names as n
-import video_utilities as video_utils
-from logger import logging
+from source import datasets, models
+from source.config import locations, names, settings
+from source.data import datatypes as dt
+from source.db import database_manager as dbm
+from source.utils import coco_evaluation_utilities, image_utilities, video_utilities
+from source.utils.logger import logging
 
 log = logging.getLogger(__name__)
-log.setLevel(configuration.LOG_LEVEL)
+log.setLevel(settings.LOG_LEVEL)
+
 
 # pylint: disable=no-value-for-parameter
 #         Disabled, because the dbm-function receive the
@@ -54,7 +53,7 @@ def infer_one_epoch(validation_model, data_loader):
         validation_model.eval()
         for images, labels in tqdm.tqdm(data_loader):
             # Moving input to the right device:
-            images = list(image.to(device=configuration.DEVICE) for image in images)
+            images = list(image.to(device=settings.DEVICE) for image in images)
             predictions = validation_model(images)
             for prediction, label, image in zip(predictions, labels, images):
                 coco_predictions.extend(
@@ -63,7 +62,9 @@ def infer_one_epoch(validation_model, data_loader):
                     )
                 )
             del images
-            if configuration.DEVICE == "cuda":
+            del labels
+            del predictions
+            if settings.DEVICE == "cuda":
                 th.cuda.empty_cache()
     return tuple(coco_predictions)
 
@@ -89,12 +90,15 @@ def evaluate_on_cranfield(model_state_id: int):
     ground_truth_json = locations.Results.coco_jsons / "cranfield_targets.json"
     log.info("Getting the ground truth ...")
     coco_evaluation_utilities.create_coco_ground_truth_json(
-        dataset_name=n.DatasetNames.cranfield_default,
-        data_category=n.DataCategoryNames.validation,
+        dataset_name=names.DatasetNames.cranfield_default,
+        data_category=names.DataCategoryNames.validation,
         ground_truth_json=ground_truth_json,
     )
     log.info("Generating the predictions ...")
-    detection_json = locations.Results.coco_jsons / f"cranfield_prediction_model_state_{model_state_id:03d}.json"
+    detection_json = (
+        locations.Results.coco_jsons
+        / f"cranfield_prediction_model_state_{model_state_id:03d}.json"
+    )
     generate_coco_predictions_for_model(
         model_state_id=model_state_id,
         data_loader=datasets.get_cranfield_default_dataloader_validation(
@@ -117,7 +121,7 @@ def evaluate_on_dvb_video(video_name: str, model_state_id: int) -> float:
     log.info("Getting the ground truth ...")
     coco_evaluation_utilities.create_coco_ground_truth_json(
         dataset_name=video_name,
-        data_category=n.DataCategoryNames.testing,
+        data_category=names.DataCategoryNames.testing,
         ground_truth_json=ground_truth_json,
     )
     log.info("Generating the predictions ...")
@@ -142,7 +146,10 @@ def evaluate_on_dvb_video(video_name: str, model_state_id: int) -> float:
 
 
 def create_video_from_coco_result_file(
-    video_name_stem: str, json_path: Path, video_target_path: Path
+    video_name_stem: str,
+    json_path: Path,
+    video_target_path: Path,
+    frame_rate: float = 60,
 ):
     """
     Create a video from the results of a drone prediction run.
@@ -152,6 +159,7 @@ def create_video_from_coco_result_file(
             Name of the video to illustrate the prediction and ground truth in.
         video_target_path:
             Location for the video to be stored in.
+        frame_rate: The frame rate of the video (optional). Default is 60 FPS.
         json_path:
             Location of the Coco result json-file.
 
@@ -204,7 +212,7 @@ def create_video_from_coco_result_file(
             predictions_for_images[prediction.image_id].append(prediction)
 
     log.debug("Creating the images ...")
-    image_utils.create_images_with_prediction_and_ground_truth(
+    image_utilities.create_images_with_prediction_and_ground_truth(
         image_ids=image_ids,
         predictions_for_images=predictions_for_images,
         target_folder=temp_folder,
@@ -214,35 +222,127 @@ def create_video_from_coco_result_file(
     width, height = dbm.get_video_shape_for_video_id(video_id=video_id)
     if not video_target_path.parent.exists():
         video_target_path.parent.mkdir(parents=True)
-    video_utils.create_video_from_images_in_folder(
+    video_utilities.create_video_from_images_in_folder(
         image_folder=temp_folder,
         width=width,
         height=height,
         video_target_path=video_target_path,
+        frame_rate=frame_rate,
     )
 
 
+def create_video_worker(video_name: str, model_state_id: int):
+    create_video_from_coco_result_file(
+        video_name_stem=video_name,
+        json_path=locations.Results.coco_jsons
+        / f"dvb_{video_name}_model_state_{model_state_id:03d}_prediction.json",
+        video_target_path=locations.Results.coco_videos
+        / "hard_videos"
+        / f"dvb_{video_name}_model_state_{model_state_id:03d}_prediction.avi",
+        frame_rate=45.0,
+    )
+    print(f"Video {video_name} completed.")
+
+
+def create_hard_videos():
+
+    model_state = 80
+    hard_videos = names.DroneVsBirdVideos.hard_videos
+
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        # `map` preserves order; `imap_unordered` yields results as they finish
+        pool.starmap(
+            create_video_worker,
+            ((hard_video, model_state) for hard_video in hard_videos),
+        )
+        # evaluate_on_dvb_video(
+        #     video_name=video_name,
+        #     model_state_id=model_state)
+
+
+def infer_one_image(image_path: Path, model_state_id: int):
+
+    image = PIL.Image.open(image_path, mode="r").convert("RGB")
+
+    normalization_data = dbm.get_normalization_data_for_id(
+        normalization_data_id=dbm.get_normalization_data_id_for_dataset_id(
+            dataset_id=dbm.get_dataset_id_for_model_state_id(model_state_id)
+        )
+    )
+
+    transforms = v2.Compose(
+        [
+            v2.ToImage(),
+            v2.ToDtype(th.float32, scale=True),
+            v2.Normalize(mean=normalization_data.mean, std=normalization_data.std),
+        ]
+    )
+    input_image_tensor = transforms(image).to(settings.DEVICE)
+
+    restored_model = models.restore_model_state(model_state_id=model_state_id)
+    restored_model.eval()
+    with th.no_grad():
+        predictions = restored_model([input_image_tensor])
+
+    annotations = []
+    labels = predictions[0]["labels"].detach().to("cpu").tolist()
+    boxes = predictions[0]["boxes"].detach().to("cpu").tolist()
+    scores = predictions[0]["scores"].detach().to("cpu").tolist()
+    for label, box, score in zip(labels, boxes, scores):
+        annotations.append(
+            dt.Annotation(
+                image_id=-1,
+                label_id=label,
+                x_min=box[0],
+                y_min=box[1],
+                x_max=box[2],
+                y_max=box[3],
+                id=-1,
+                score=score,
+            )
+        )
+
+    image_utilities.add_bounding_boxes_to_image(
+        img=image,
+        bboxes=annotations,
+        legend_entry=dt.ImageLegendEntry(xy=(5, 5), text="Prediction"),
+    ).show()
+
+
 if __name__ == "__main__":
+    # create_hard_videos()
+    # model_states = [69, 80]
+    # file = locations.RESULTS_DIR / f"ap05_model_state_{model_state}.csv"
+    #
+    # with open(file, "a", encoding="utf-8") as f:
+    #     f.write("Video Name,AP@0.5\n")
+    #
+    # for video_name in ["fixed_wing_over_hill_1"]:
+    #     ap_05 = evaluate_on_dvb_video(
+    #         video_name=video_name,
+    #         model_state_id=model_state)
+    #
+    #     with open(file, "a", encoding="utf-8") as f:
+    #         f.write(f"{video_name},{ap_05}\n")
+    #
+    #     print(f"{video_name},{ap_05}")
 
-    ap_05_l = []
-    model_state = 69
+    infer_one_image(
+        image_path=locations.TEMP_DIR / "image_size_experiment" / "larger" / "0.png",
+        model_state_id=80,
+    )
 
-    for video_name in n.DroneVsBirdVideos.video_names:
+    infer_one_image(
+        image_path=locations.TEMP_DIR / "image_size_experiment" / "same" / "0.png",
+        model_state_id=80,
+    )
 
-        ap_05 = evaluate_on_dvb_video(
-            video_name=video_name,
-            model_state_id=model_state)
+    infer_one_image(
+        image_path=locations.TEMP_DIR / "image_size_experiment" / "smaller" / "0.png",
+        model_state_id=80,
+    )
 
-        print(f"{video_name}: {ap_05}")
-        ap_05_l.append(ap_05)
-
-    for video_name, ap_05 in zip(n.DroneVsBirdVideos.video_names, ap_05_l):
-        print(f"{video_name}: {ap_05:0.3f}")
-
-        # create_video_from_coco_result_file(
-        #     video_name_stem=video_name,
-        #     json_path=locations.Results.coco_jsons
-        #     / f"dvb_{video_name}_model_state_{model_state:03d}_prediction.json",
-        #     video_target_path=locations.Results.coco_videos
-        #     / f"dvb_{video_name}_model_state_{model_state:03d}_prediction.avi",
-        # )
+    infer_one_image(
+        image_path=locations.TEMP_DIR / "image_size_experiment" / "smallest" / "0.png",
+        model_state_id=80,
+    )

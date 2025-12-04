@@ -13,10 +13,9 @@ import torchvision.tv_tensors
 import tqdm
 from torchvision.transforms import v2
 
-import database_manager as dbm
-import datatypes as dt
-import locations as loca
-from datatypes import Annotation
+from source.config import locations
+from source.data import datatypes as dt
+from source.db import database_manager as dbm
 
 # pylint: disable=no-value-for-parameter
 #         Disabled, because the dbm-function receive the
@@ -30,7 +29,6 @@ def create_image_from_path(path: Path, data_origin: str) -> dt.Image:
     data_origin_id = dbm.get_data_origin_id_for_name(data_origin)
     image = PIL.Image.open(path, mode="r").convert("RGB")
     width, height = image.size
-    # Encode to JPEG in memory
     with io.BytesIO() as buffer:
         image.save(buffer, format="PNG")
         png_bytes = buffer.getvalue()
@@ -53,7 +51,7 @@ def add_bounding_boxes_to_certain_image(image_id: int):
 
 def add_bounding_boxes_to_image(
     img: PIL.Image.Image,
-    bboxes: list[Annotation],
+    bboxes: list[dt.Annotation],
     color: str = "blue",
     legend_entry: dt.ImageLegendEntry = None,
 ) -> PIL.Image.Image:
@@ -90,7 +88,7 @@ def add_bounding_boxes_to_image(
 
 
 def add_broken_bounding_boxes_to_image(
-    img: PIL.Image.Image, broken_bboxes: list[Annotation]
+    img: PIL.Image.Image, broken_bboxes: list[dt.Annotation]
 ) -> PIL.Image.Image:
     drw = PIL.ImageDraw.Draw(img, "RGB")
     for broken_bbox in broken_bboxes:
@@ -104,10 +102,10 @@ def add_broken_bounding_boxes_to_image(
 
 def create_images_with_prediction_and_ground_truth(
     image_ids: list[int],
-    predictions_for_images: dict[int, list[Annotation]],
+    predictions_for_images: dict[int, list[dt.Annotation]],
     target_folder: Path,
 ):
-    for image_id in tqdm.tqdm(image_ids):
+    for image_id in image_ids:
         # Adding the predictions to the image
         image = image_blob_to_image(dbm.get_image_for_id(image_id=image_id))
         if image_id in predictions_for_images:
@@ -152,7 +150,8 @@ def image_blob_to_tensor(img_blob: bytes, scale: bool) -> torchvision.tv_tensors
 
     Args:
         img_blob: The image blob from the database.
-        scale: Whether to scale the image. Scaling brings the values into the range [0 ... 1].
+        scale: Whether to scale the image.
+            Scaling brings the values into the range [0 ... 1].
 
     Returns:
         Image as a tensor
@@ -175,9 +174,9 @@ def draw_bounding_boxes_for_video(video_id: int, video_name: str = "None"):
         except IndexError:
             pass
         if video_name == "None":
-            image.save(loca.CACHE_DIR / f"{image_id}.jpg")
+            image.save(locations.CACHE_DIR / f"{image_id}.jpg")
         else:
-            image.save(loca.CACHE_DIR / f"{video_name}_{image_id}.jpg")
+            image.save(locations.CACHE_DIR / f"{video_name}_{image_id}.jpg")
 
 
 def move_images_to_folders(path: Path):
@@ -187,8 +186,8 @@ def move_images_to_folders(path: Path):
         folder_name = "_".join(name_components[0:-1])
         if folder_name not in folder_names:
             folder_names.add(folder_name)
-            (loca.CACHE_DIR / folder_name).mkdir()
-        shutil.move(src=image, dst=loca.CACHE_DIR / folder_name)
+            (locations.CACHE_DIR / folder_name).mkdir()
+        shutil.move(src=image, dst=locations.CACHE_DIR / folder_name)
 
 
 def turn_all_videos_to_images_with_bounding_boxes():

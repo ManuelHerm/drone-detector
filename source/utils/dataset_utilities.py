@@ -4,28 +4,26 @@ from typing import TypeVar
 
 import tqdm
 
-import configuration
-import database_manager as dbm
-import datatypes as dt
-import image_utilities as img_util
-import locations as loc
-import names
-from cache import get_cache
-from lib.welford_torch import Welford
-from logger import logging
+from source.config import locations, names, settings
+from source.data import datatypes as dt
+from source.data.cache import get_cache
+from source.db import database_manager as dbm
+from source.utils import image_utilities as img_util
+from source.utils.logger import logging
+from source.utils.welford_torch import Welford
 
 T = TypeVar("T")
-cranfield_cache = get_cache(loc.Cache.cranfield)
+cranfield_cache = get_cache(locations.Cache.cranfield)
 
 log = logging.getLogger(__name__)
-log.setLevel(configuration.LOG_LEVEL)
+log.setLevel(settings.LOG_LEVEL)
 
 # pylint: disable=no-value-for-parameter
 #         Disabled, because the dbm-function receive the
 #         cursor parameter from the decorator.
 
 
-def split_cranfields_dataset_into_training_and_validation_and_insert_to_db(
+def split_cranfields_dataset_into_train_and_val_and_insert_to_db(
     dataset_name: str,
     data_origin: str,
     validation_stride: int,
@@ -33,7 +31,8 @@ def split_cranfields_dataset_into_training_and_validation_and_insert_to_db(
     limit: int = None,
 ):
     """
-    Divide Cranfield's dataset with no birds and 40m box size into training and validation sets.
+    Divide Cranfield's dataset with no birds and 40m box size
+    into training and validation sets.
 
     Divide the set considering the number of drones in each picture.
     Each dataset shall have a comparable distribution of number of drones per picture.
@@ -124,7 +123,8 @@ def compute_normalization_data_and_insert_to_db(
     limit: int = None,
 ):
     """
-    Compute mean and standard deviation for a training dataset and insert it into the database.
+    Compute mean and standard deviation for a training dataset
+    and insert it into the database.
 
     Args:
         dataset_name: The mean and standard deviation get computed for this dataset.
@@ -145,16 +145,17 @@ def compute_normalization_data_and_insert_to_db(
     # This does not fit.
     # The algorithm is from Weldford and the implementation is from
     # https://github.com/nickypro/welford-torch
-    w = Welford(device=configuration.DEVICE)
+    w = Welford(device=settings.DEVICE)
     log.debug("Begin iteration over images for mean and standard deviation.")
     for i, image_id in enumerate(image_ids):
         if i % 100 == 0:
             log.debug("Processing image %s.", i)
         image_blob = dbm.get_image_for_id(image_id)
         image_tensor = img_util.image_blob_to_tensor(image_blob, scale=True).to(
-            device=configuration.DEVICE
+            device=settings.DEVICE
         )
-        # Collapsing the height and width dimensions, leaving only the channel dimension.
+        # Collapsing the height and width dimensions,
+        # leaving only the channel dimension.
         image_channel_tensor = image_tensor.flatten(start_dim=1).T
         w.add_all(image_channel_tensor)
     channel_means = w.mean.to("cpu").tolist()

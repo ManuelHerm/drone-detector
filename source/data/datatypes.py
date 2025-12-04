@@ -7,11 +7,11 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-import configuration
-from logger import logging
+from ..config import settings
+from ..utils.logger import logging
 
 log = logging.getLogger(__name__)
-log.setLevel(configuration.LOG_LEVEL)
+log.setLevel(settings.LOG_LEVEL)
 
 # pylint: disable=missing-class-docstring
 #         Disabled because the classes are trivial

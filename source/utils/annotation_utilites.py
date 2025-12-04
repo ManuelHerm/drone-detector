@@ -8,15 +8,14 @@ import tqdm
 from torchvision.io import decode_image
 from torchvision.ops import masks_to_boxes
 
-import configuration
-import database_manager as dbm
-import datatypes as dt
-import image_utilities as img_util
-import locations
-from logger import logging
+from source.config import locations, settings
+from source.data import datatypes as dt
+from source.db import database_manager as dbm
+from source.utils import image_utilities as img_util
+from source.utils.logger import logging
 
 log = logging.getLogger(__name__)
-log.setLevel(configuration.LOG_LEVEL)
+log.setLevel(settings.LOG_LEVEL)
 
 # pylint: disable=no-value-for-parameter
 #         Disabled, because the dbm-function receive the
@@ -27,14 +26,16 @@ def parse_dvb_annotations(file: Path) -> list[dt.Annotation]:
     """
     Parse the drone versus bird annotation file
 
-    The file layout is:
+    The file layout is::
 
         <frame_#> <drone count> <x1> <y1> <w1> <h1> drone <x2> <y2> <w2> <h2> drone  ...
         <frame_#> <drone count> <x1> <y1> <w1> <h1> drone <x2> <y2> <w2> <h2> drone  ...
 
     All values are space separated.
 
-    The database setup is so, that if there are no drones detected, then no annotation is needed.
+    The database setup is so, that if there are no drones detected,
+    then no annotation is needed.
+
     Hence, when the <number of drones> is zero, the line will be skipped.
 
     Args:
@@ -72,7 +73,8 @@ def parse_dvb_annotations(file: Path) -> list[dt.Annotation]:
             image_id = dbm.get_image_id_for_video_id_and_frame_number(
                 video_id, frame_number
             )
-        # If annotation file contains frames that are not in the video, then just continue.
+        # If annotation file contains frames that are not in the video,
+        # then just continue.
         except ValueError:
             continue
 
@@ -95,9 +97,9 @@ def parse_dvb_annotations(file: Path) -> list[dt.Annotation]:
 
 def insert_all_dvb_annotations_into_db():
     """
-    Read all annotation files from the drone vs. bird location and insert them in the database.
+    Read all drone vs. bird annotation files and insert them in the database.
 
-    The location is defined in `locations.py`.
+    Their location is defined in `locations.py`.
     """
     files = list(sorted(locations.DroneVsBird.annotations.iterdir()))
     for file in tqdm.tqdm(files):
@@ -166,7 +168,7 @@ def get_annotations_from_cranfield_segmentation_mask(
     return [
         annotation
         for annotation in annotations
-        if annotation.get_area() >= configuration.BBOX_MIN_AREA
+        if annotation.get_area() >= settings.BBOX_MIN_AREA
     ]
 
 
@@ -181,7 +183,7 @@ def find_broken_annotations() -> set[int]:
     area_too_small = set(
         annotation.id
         for annotation in annotations
-        if annotation.get_area() < configuration.BBOX_MIN_AREA
+        if annotation.get_area() < settings.BBOX_MIN_AREA
     )
     return area_too_small
 

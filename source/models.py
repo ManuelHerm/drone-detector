@@ -7,8 +7,8 @@ import torchvision as tv
 from torchvision.models.detection import FasterRCNN, FasterRCNN_ResNet50_FPN_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
-import configuration
-import database_manager as dbm
+from source.config import settings
+from source.db import database_manager as dbm
 
 # pylint: disable=no-value-for-parameter
 #         Disabled, because the dbm-function receive the
@@ -29,14 +29,14 @@ def get_faster_r_cnn_model(num_classes) -> FasterRCNN:
     """
     faster_r_cnn_model = tv.models.detection.fasterrcnn_resnet50_fpn(
         weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT,
-        box_score_thresh=configuration.BOX_SCORE_THRESH,
+        box_score_thresh=settings.BOX_SCORE_THRESH,
     )
     in_features = faster_r_cnn_model.roi_heads.box_predictor.cls_score.in_features
     # Replace the pre-trained head with a new one
     faster_r_cnn_model.roi_heads.box_predictor = FastRCNNPredictor(
         in_features, num_classes
     )
-    return faster_r_cnn_model.to(configuration.DEVICE)
+    return faster_r_cnn_model.to(settings.DEVICE)
 
 
 @th.no_grad()
@@ -52,6 +52,7 @@ def save_progress(
     lr_scheduler_to_save: th.optim.lr_scheduler.LRScheduler,
     epochs_trained: int,
     dataset_id: int,
+    samples_trained: int,
 ):
     dbm.insert_model_state(
         dataset_id=dataset_id,
@@ -62,14 +63,13 @@ def save_progress(
         optimizer_state=save_torch_state(optimizer_to_save),
         lr_scheduler_state=save_torch_state(lr_scheduler_to_save),
         epochs_trained=epochs_trained,
+        samples_trained=samples_trained,
     )
 
 
 def restore_model_state(model_state_id: int) -> th.nn.Module:
     model_blob = dbm.get_model_state(model_state_id)
-    model_state_dict = th.load(
-        io.BytesIO(model_blob), map_location=configuration.DEVICE
-    )
-    model = get_faster_r_cnn_model(configuration.NUM_CLASSES)
+    model_state_dict = th.load(io.BytesIO(model_blob), map_location=settings.DEVICE)
+    model = get_faster_r_cnn_model(settings.NUM_CLASSES)
     model.load_state_dict(model_state_dict)
     return model

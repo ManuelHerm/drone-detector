@@ -10,14 +10,14 @@ root_logger.setLevel(logging.INFO)
 for handler in list(root_logger.handlers):
     root_logger.removeHandler(handler)
 
-logfmt_str = (
+LOGFMT_STR = (
     "%(asctime)s %(levelname)-8s pid:%(process)d "
     "%(name)s:%(lineno)03d:%(funcName)s %(message)s"
 )
-formatter = logging.Formatter(logfmt_str)
+FORMATTER = logging.Formatter(LOGFMT_STR)
 
-streamHandler = logging.StreamHandler()
-streamHandler.setFormatter(formatter)
-streamHandler.setLevel(logging.DEBUG)
+STREAM_HANDLER = logging.StreamHandler()
+STREAM_HANDLER.setFormatter(FORMATTER)
+STREAM_HANDLER.setLevel(logging.DEBUG)
 
-root_logger.addHandler(streamHandler)
+root_logger.addHandler(STREAM_HANDLER)

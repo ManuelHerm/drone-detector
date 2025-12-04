@@ -17,6 +17,9 @@ import copy
 
 import torch
 
+# pylint: skip-file
+# This is just copied from GitHub and will not be refactored.
+
 
 class Welford:
     """class Welford

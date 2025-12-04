@@ -8,8 +8,8 @@ from pathlib import Path
 import cv2
 import tqdm
 
-import database_manager as dbm
-import datatypes as dt
+from source.data import datatypes as dt
+from source.db import database_manager as dbm
 
 # pylint: disable=no-value-for-parameter
 #         Disabled, because the dbm-function receive the
@@ -21,7 +21,7 @@ import datatypes as dt
 
 def video_to_images(data_origin: str):
     """
-    Turn video from the database into images and add them with all their references to the database.
+    Turn video from the database into images and add them with metadata to the database.
 
     This means:
         - Adding the image with a fitting name to the images table.
@@ -86,10 +86,14 @@ def create_video_from_path(path: Path, data_origin_name: str) -> dt.Video:
 
 
 def create_video_from_images_in_folder(
-    image_folder: Path, video_target_path: Path, width: float, height: float
+    image_folder: Path,
+    video_target_path: Path,
+    width: float,
+    height: float,
+    frame_rate: float = 60,
 ):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # use "XVID" or "avc1" if needed
-    out = cv2.VideoWriter(str(video_target_path), fourcc, 60, (width, height))
+    out = cv2.VideoWriter(str(video_target_path), fourcc, frame_rate, (width, height))
 
     for file_name in sorted(image_folder.iterdir()):
         img = cv2.imread(str(file_name), cv2.IMREAD_UNCHANGED)

@@ -8,21 +8,19 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import tv_tensors
 from torchvision.transforms import v2
 
-import configuration
-import database_manager as dbm
-import image_utilities as img_util
-import locations as loc
-import names
-from cache import get_cache
-from logger import logging
+from source.config import locations, names, settings
+from source.data.cache import get_cache
+from source.db import database_manager as dbm
+from source.utils import image_utilities
+from source.utils.logger import logging
 
 T = TypeVar("T")
 random.seed(918)
-cranfield_cache = get_cache(loc.Cache.cranfield)
-drone_vs_bird_cache = get_cache(loc.Cache.drone_vs_bird)
+cranfield_cache = get_cache(locations.Cache.cranfield)
+drone_vs_bird_cache = get_cache(locations.Cache.drone_vs_bird)
 
 log = logging.getLogger(__name__)
-log.setLevel(configuration.LOG_LEVEL)
+log.setLevel(settings.LOG_LEVEL)
 
 # pylint: disable=no-value-for-parameter
 #         Disabled, because the dbm-function receive the
@@ -73,7 +71,7 @@ def get_untransformed_uncached_function(
             {"boxes": tv_tensor.BoundingBox, "labels": torch.tensor, "image_id": int}.
     """
     image_blob = dbm.get_image_for_id(image_id)
-    image_tensor = img_util.image_blob_to_tensor(image_blob, scale=True)
+    image_tensor = image_utilities.image_blob_to_tensor(image_blob, scale=True)
     try:
         annotations = dbm.get_annotations_for_image_id(image_id)
         boxes = tv_tensors.BoundingBoxes(
@@ -124,7 +122,8 @@ class DroneDataset(Dataset):
 
         Args:
             dataset_name: Name of the dataset.
-            data_category_name: Name of the data category (like "training" or "validation").
+            data_category_name: Name of the data category
+                (like "training" or "validation").
             augment: Whether to augment the data using transforms.
             get_untransformed_function: Function that retrieves untransformed
                 samples from the database.
@@ -145,8 +144,8 @@ class DroneDataset(Dataset):
         self.get_untransformed = get_untransformed_function
 
     def __len__(self):
-        if configuration.HAS_DATASET_LENGTH_LIMIT:
-            return min(configuration.LIM_DATASET_LENGTH, len(self.image_ids))
+        if settings.HAS_DATASET_LENGTH_LIMIT:
+            return min(settings.LIM_DATASET_LENGTH, len(self.image_ids))
         return len(self.image_ids)
 
     def __getitem__(self, index):
@@ -208,8 +207,8 @@ def get_drone_vs_bird_dataloader(normalization_data_id: int):
     )
     return th.utils.data.DataLoader(
         dataset,
-        batch_size=configuration.BATCH_SIZE_TEST,
-        num_workers=configuration.NUM_WORKERS_TEST,
+        batch_size=settings.BATCH_SIZE_TEST,
+        num_workers=settings.NUM_WORKERS_TEST,
         collate_fn=batch_to_tuple,
         pin_memory=True,
     )
@@ -235,8 +234,8 @@ def get_cranfield_default_dataloader_training() -> DataLoader:
     )
     return th.utils.data.DataLoader(
         dataset,
-        batch_size=configuration.BATCH_SIZE_TRAIN,
-        num_workers=configuration.NUM_WORKERS_TRAIN,
+        batch_size=settings.BATCH_SIZE_TRAIN,
+        num_workers=settings.NUM_WORKERS_TRAIN,
         collate_fn=batch_to_tuple,
         pin_memory=True,
     )
@@ -269,8 +268,8 @@ def get_dataloader(
     )
     return th.utils.data.DataLoader(
         dataset,
-        batch_size=configuration.BATCH_SIZE_TRAIN,
-        num_workers=configuration.NUM_WORKERS_TRAIN,
+        batch_size=settings.BATCH_SIZE_TRAIN,
+        num_workers=settings.NUM_WORKERS_TRAIN,
         collate_fn=batch_to_tuple,
         pin_memory=True,
     )
@@ -300,8 +299,8 @@ def get_cranfield_default_dataloader_validation(
     )
     return th.utils.data.DataLoader(
         dataset,
-        batch_size=configuration.BATCH_SIZE_TEST,
-        num_workers=configuration.NUM_WORKERS_TEST,
+        batch_size=settings.BATCH_SIZE_TEST,
+        num_workers=settings.NUM_WORKERS_TEST,
         collate_fn=batch_to_tuple,
         pin_memory=True,
     )
@@ -336,8 +335,8 @@ def get_drone_vs_bird_single_video_dataloader(
     )
     return th.utils.data.DataLoader(
         dataset,
-        batch_size=configuration.BATCH_SIZE_TEST,
-        num_workers=configuration.NUM_WORKERS_TEST,
+        batch_size=settings.BATCH_SIZE_TEST,
+        num_workers=settings.NUM_WORKERS_TEST,
         collate_fn=batch_to_tuple,
         pin_memory=True,
     )

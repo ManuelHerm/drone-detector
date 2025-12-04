@@ -5,19 +5,20 @@ from pathlib import Path
 
 import tqdm
 
-import annotation_utilites as annot_util
-import configuration
-import database_manager as dbm
-import dataset_utilities as dataset_utils
-import image_utilities as img_util
-import locations
-import names
-import video_utilities as video_utils
-from logger import logging
-from source.annotation_utilites import fix_broken_annotations
+from source.config import locations, names, settings
+from source.db import database_initializer
+from source.db import database_manager as dbm
+from source.utils import (
+    annotation_utilites,
+    dataset_utilities,
+    image_utilities,
+    video_utilities,
+)
+from source.utils.annotation_utilites import fix_broken_annotations
+from source.utils.logger import logging
 
 log = logging.getLogger(__name__)
-log.setLevel(configuration.LOG_LEVEL)
+log.setLevel(settings.LOG_LEVEL)
 
 
 # pylint: disable=no-value-for-parameter
@@ -40,7 +41,7 @@ def ingest_cranfield_data(
     cranfield_images_paths = list(sorted(image_folder.iterdir()))
     for image_path in tqdm.tqdm(cranfield_images_paths):
         dbm.insert_image(
-            img_util.create_image_from_path(
+            image_utilities.create_image_from_path(
                 path=image_path, data_origin=data_origin_name
             )
         )
@@ -49,7 +50,7 @@ def ingest_cranfield_data(
     cranfield_masks_paths = list(sorted(mask_folder.iterdir()))
     for cranfield_masks_path in tqdm.tqdm(cranfield_masks_paths):
         annotations_per_image = (
-            annot_util.get_annotations_from_cranfield_segmentation_mask(
+            annotation_utilites.get_annotations_from_cranfield_segmentation_mask(
                 cranfield_masks_path
             )
         )
@@ -60,16 +61,18 @@ def ingest_cranfield_data(
 
     log.info("Splitting dataset into training and validation ...")
     # Split into training and validation and record the split in the database
-    dataset_utils.split_cranfields_dataset_into_training_and_validation_and_insert_to_db(
+    dataset_utilities.split_cranfields_dataset_into_train_and_val_and_insert_to_db(
         dataset_name=dataset_name,
         data_origin=data_origin_name,
         validation_stride=validation_stride,
     )
 
-    log.info("Computing and capturing the normalization data ...", data_origin_name)
+    log.info("Computing and capturing the normalization data ...")
     # Compute the normalization data for the training set and store the
     # result in the database
-    dataset_utils.compute_normalization_data_and_insert_to_db(dataset_name=dataset_name)
+    dataset_utilities.compute_normalization_data_and_insert_to_db(
+        dataset_name=dataset_name
+    )
 
 
 def ingest_drone_vs_bird_data():
@@ -80,7 +83,7 @@ def ingest_drone_vs_bird_data():
     videos = []
     for video_path in tqdm.tqdm(sorted(locations.DroneVsBird.videos.iterdir())):
         videos.append(
-            video_utils.create_video_from_path(
+            video_utilities.create_video_from_path(
                 path=video_path, data_origin_name=names.DataOriginNames.drone_vs_bird
             )
         )
@@ -89,10 +92,10 @@ def ingest_drone_vs_bird_data():
         "Turning the images on the disk into images in the database.\n"
         "Also recording the relationship between video, video frame and image."
     )
-    video_utils.video_to_images(data_origin=names.DataOriginNames.drone_vs_bird)
+    video_utilities.video_to_images(data_origin=names.DataOriginNames.drone_vs_bird)
     # Ingest the annotation data
     log.info("Ingesting drone vs. bird annotations into database.")
-    annot_util.insert_all_dvb_annotations_into_db()
+    annotation_utilites.insert_all_dvb_annotations_into_db()
 
 
 def create_drone_vs_bird_video_datasets():
@@ -120,10 +123,11 @@ def combining_datasets(
     """
     Combining two datasets into a single dataset.
 
-    Merging the training subsets with each other, the validation subsets with each other,
+    Merging the training subsets with each other,
+    the validation subsets with each other,
     and the testing subsets with each other.
 
-    Args:
+    Ars:
         dataset_name: The name of the combined dataset.
         first_dataset_name: Name of the first dataset to merge
         second_dataset_name: Name of the second dataset to merge
@@ -170,12 +174,14 @@ def combining_datasets(
         )
         dbm.insert_data_subset(data_subset_content=data_subset_content)
     log.info("Computing the normalization data and inserting it into the database")
-    dataset_utils.compute_normalization_data_and_insert_to_db(dataset_name=dataset_name)
+    dataset_utilities.compute_normalization_data_and_insert_to_db(
+        dataset_name=dataset_name
+    )
 
 
 if __name__ == "__main__":
     # Create the database tables
-    dbm.initialize_database()
+    database_initializer.initialize_database()
     # Insert the default dataset categories
     dbm.insert_data_categories()
     # Insert the Cranfield data
@@ -204,6 +210,6 @@ if __name__ == "__main__":
     # Create Drone versus Bird dataset
     dbm.insert_dataset(name=names.DatasetNames.drone_vs_bird)
     # Create the testing Drone versus Bird data subset
-    dataset_utils.create_drone_vs_bird_testing_data_subset()
+    dataset_utilities.create_drone_vs_bird_testing_data_subset()
     # Insert a dataset for each drone vs. bird video
     create_drone_vs_bird_video_datasets()

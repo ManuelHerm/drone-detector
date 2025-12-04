@@ -2,61 +2,19 @@
 
 from __future__ import annotations
 
-import functools
 import sqlite3
 from dataclasses import asdict
-from typing import Callable
 
-import datatypes as dt
-from datatypes import Annotation
-from locations import DB_PATH
+from source.data import datatypes as dt
+from source.db.connection import database_connection
+from source.db.database_initializer import initialize_database
 
 # pylint: disable=no-value-for-parameter
 #         Disabled, because the dbm-function receive the
 #         cursor parameter from the decorator.
-
-
-def database_connection(func) -> Callable:
-    """
-    Manage the database connection.
-
-    - Begins and ends the transaction.
-    - Carries out rollback in case of an error.
-
-    The decorated function needs a parameter called cursor of type ``sqlite3.Cursor``.
-    This allows the decorated function to use the database.
-
-    Args:
-        func: Function to decorate.
-
-    Returns:
-        Return value of the decorated function.
-
-    Raises:
-        sqlite3.Error, if there was a database error.
-    """
-
-    @functools.wraps(func)
-    def wrapper_database_connection(*args, **kwargs):
-        con = sqlite3.connect(DB_PATH)
-        con.row_factory = sqlite3.Row
-        con.execute("PRAGMA foreign_keys = ON;")
-        cur = con.cursor()
-        try:
-            # database function gets the cursor
-            # from the decorator
-            con.execute("BEGIN TRANSACTION;")
-            return_value = func(*args, cursor=cur, **kwargs)
-            con.commit()
-            return return_value
-        except sqlite3.Error as e:
-            con.rollback()
-            raise sqlite3.Error(e)
-        finally:
-            cur.close()
-            con.close()
-
-    return wrapper_database_connection
+# pylint: disable=missing-function-docstring
+#         There are many functions following the same pattern.
+#         They are simple and can be understood by their signature.
 
 
 @database_connection
@@ -136,20 +94,21 @@ def insert_model_state(
     optimizer_state: bytes,
     lr_scheduler_state: bytes,
     epochs_trained: int,
+    samples_trained: int,
     cursor: sqlite3.Cursor,
 ) -> int:
     cursor.execute(
         """
-        INSERT INTO model_states
-        (dataset_id,
-         model_type,
-         optimizer_type,
-         lr_scheduler_type,
-         model_state,
-         optimizer_state,
-         lr_scheduler_state,
-         epochs_trained)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO model_states (dataset_id,
+                                  model_type,
+                                  optimizer_type,
+                                  lr_scheduler_type,
+                                  model_state,
+                                  optimizer_state,
+                                  lr_scheduler_state,
+                                  epochs_trained,
+                                  samples_trained)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             dataset_id,
@@ -160,6 +119,7 @@ def insert_model_state(
             optimizer_state,
             lr_scheduler_state,
             epochs_trained,
+            samples_trained,
         ),
     )
     return cursor.lastrowid
@@ -301,8 +261,15 @@ def insert_normalization_dataset(data: dt.NormalizationData, cursor: sqlite3.Cur
     """
     cursor.execute(
         """
-        INSERT INTO normalization_data
-        (dataset_id, mean_ch_0, mean_ch_1, mean_ch_2, std_dev_ch_0, std_dev_ch_1, std_dev_ch_2)
+        INSERT INTO normalization_data (
+            dataset_id, 
+            mean_ch_0, 
+            mean_ch_1, 
+            mean_ch_2, 
+            std_dev_ch_0, 
+            std_dev_ch_1, 
+            std_dev_ch_2
+        )
         VALUES (?, ?, ?, ?, ?, ?, ?);
         """,
         (
@@ -318,7 +285,7 @@ def insert_normalization_dataset(data: dt.NormalizationData, cursor: sqlite3.Cur
 
 
 def _create_annotation_from_dict(annotation_row: dict) -> dt.Annotation:
-    return Annotation(
+    return dt.Annotation(
         id=annotation_row["id"],
         image_id=annotation_row["image_id"],
         label_id=annotation_row["label_id"],
@@ -446,6 +413,17 @@ def get_dataset_name_for_id(dataset_id: int, cursor: sqlite3.Cursor) -> str:
     if row:
         return row["name"]
     raise IndexError(f"There is no dataset with the id = {dataset_id}.")
+
+
+@database_connection
+def get_epochs_trained(model_state_id: int, cursor: sqlite3.Cursor) -> int:
+    cursor.execute(
+        "SELECT epochs_trained from model_states WHERE id = ?", (model_state_id,)
+    )
+    row = cursor.fetchone()
+    if row:
+        return row["epochs_trained"]
+    raise IndexError(f"There is no dataset with the id = {model_state_id}.")
 
 
 @database_connection
@@ -597,6 +575,19 @@ def get_labels(cursor: sqlite3.Cursor) -> list[dt.Label]:
 
 
 @database_connection
+def get_learning_rate_scheduler_state(state_id: int, cursor: sqlite3.Cursor) -> bytes:
+    cursor.execute(
+        "SELECT lr_scheduler_state from model_states WHERE id = ?", (state_id,)
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    raise ValueError(
+        f"No learning rate scheduler with state with id = {state_id} found."
+    )
+
+
+@database_connection
 def get_model_state(model_state_id: int, cursor: sqlite3.Cursor) -> bytes:
     cursor.execute(
         "SELECT model_state from model_states WHERE id = ?", (model_state_id,)
@@ -621,9 +612,11 @@ def get_normalization_data_for_dataset_id(
     dataset_id: int, cursor: sqlite3.Cursor
 ) -> dt.NormalizationData:
     cursor.execute(
-        """SELECT mean_ch_0, mean_ch_1, mean_ch_2, std_dev_ch_0, std_dev_ch_1, std_dev_ch_2
-           from normalization_data
-           WHERE dataset_id = ?""",
+        """
+        SELECT mean_ch_0, mean_ch_1, mean_ch_2, std_dev_ch_0, std_dev_ch_1, std_dev_ch_2
+        FROM normalization_data
+        WHERE dataset_id = ?
+        """,
         (dataset_id,),
     )
     row = cursor.fetchone()
@@ -639,7 +632,7 @@ def get_normalization_data_for_dataset_id(
 @database_connection
 def get_normalization_data_id_for_dataset_id(
     dataset_id: int, cursor: sqlite3.Cursor
-) -> dt.NormalizationData:
+) -> int:
     cursor.execute(
         """
         SELECT id
@@ -660,7 +653,13 @@ def get_normalization_data_for_id(
     cursor.execute(
         """
         SELECT 
-            dataset_id, mean_ch_0, mean_ch_1, mean_ch_2, std_dev_ch_0, std_dev_ch_1, std_dev_ch_2
+            dataset_id, 
+            mean_ch_0, 
+            mean_ch_1, 
+            mean_ch_2, 
+            std_dev_ch_0, 
+            std_dev_ch_1, 
+            std_dev_ch_2
         FROM normalization_data
         WHERE id = ?""",
         (normalization_data_id,),
@@ -702,6 +701,17 @@ def get_number_of_drones_for_images(
         row = cursor.fetchone()
         drone_count_list.append((image_id, row["number_of_drones"]))
     return drone_count_list
+
+
+@database_connection
+def get_optimizer_state(model_state_id: int, cursor: sqlite3.Cursor) -> bytes:
+    cursor.execute(
+        "SELECT optimizer_state from model_states WHERE id = ?", (model_state_id,)
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    raise ValueError(f"No optimizer state with id = {model_state_id} found.")
 
 
 @database_connection
@@ -790,6 +800,21 @@ def get_video_id_for_video_name_stem(
 
 
 @database_connection
+def get_samples_trained(model_state_id: int, cursor: sqlite3.Cursor) -> int:
+    cursor.execute(
+        "SELECT samples_trained from model_states WHERE id = ?;",
+        (model_state_id,),
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    raise ValueError(
+        f"No model state with id {model_state_id} found "
+        "while searching for samples_trained."
+    )
+
+
+@database_connection
 def remove_annotations(annotations_to_remove: set[int], cursor: sqlite3.Cursor):
     """
     Remove annotations from the database.
@@ -806,191 +831,6 @@ def remove_annotations(annotations_to_remove: set[int], cursor: sqlite3.Cursor):
         """,
             (annotation_id,),
         )
-
-
-@database_connection
-def initialize_database(cursor: sqlite3.Cursor):
-    def create_data_origin(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS data_origins
-            (
-                id   INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                name TEXT    NOT NULL UNIQUE
-            );
-            """
-        )
-
-    def create_video_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS videos
-            (
-                id             INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                name           TEXT    NOT NULL UNIQUE,
-                data_origin_id INTEGER NOT NULL,
-                width          INTEGER NOT NULL,
-                height         INTEGER NOT NULL,
-                frame_rate     FLOAT   NOT NULL,
-                frame_count    INTEGER NOT NULL,
-                convert_rgb    BOOLEAN NOT NULL,
-                path           TEXT    NOT NULL UNIQUE,
-                sha_256        TEXT    NOT NULL UNIQUE,
-                FOREIGN KEY (data_origin_id) REFERENCES data_origins (id)
-            );
-            """
-        )
-
-    def create_image_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS images
-            (
-                id             INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                name           TEXT    NOT NULL UNIQUE,
-                data_origin_id INTEGER NOT NULL,
-                width          INTEGER NOT NULL,
-                height         INTEGER NOT NULL,
-                image          BLOB    NOT NULL UNIQUE,
-                FOREIGN KEY (data_origin_id) REFERENCES data_origins (id)
-            );
-            """
-        )
-
-    def create_video_frame_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS video_frames
-            (
-                id           INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                video_id     INTEGER NOT NULL,
-                image_id     INTEGER NOT NULL,
-                frame_number INTEGER NOT NULL,
-                FOREIGN KEY (video_id) REFERENCES videos (id),
-                FOREIGN KEY (image_id) REFERENCES images (id),
-                UNIQUE (video_id, image_id)
-            );
-            """
-        )
-
-    def create_labels_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS labels
-            (
-                id     INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                name   TEXT    NOT NULL UNIQUE,
-                number INTEGER NOT NULL UNIQUE
-            );
-            """
-        )
-
-    def create_annotations_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS annotations
-            (
-                id       INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                image_id INTEGER NOT NULL,
-                label_id INTEGER NOT NULL,
-                x_min    INTEGER NOT NULL,
-                y_min    INTEGER NOT NULL,
-                x_max    INTEGER NOT NULL,
-                y_max    INTEGER NOT NULL,
-                FOREIGN KEY (image_id) REFERENCES images (id),
-                FOREIGN KEY (label_id) REFERENCES labels (id)
-            );
-            """
-        )
-
-    def create_datasets_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS datasets
-            (
-                id   Integer NOT NULL PRIMARY KEY AUTOINCREMENT,
-                name TEXT    NOT NULL UNIQUE
-            );
-            """
-        )
-
-    def create_data_categories_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS data_categories
-            (
-                id   INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                name TEXT    NOT NULL UNIQUE
-            );
-            """
-        )
-
-    def create_data_subsets_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS data_subsets
-            (
-                id               Integer NOT NULL PRIMARY KEY AUTOINCREMENT,
-                dataset_id       INTEGER NOT NULL,
-                image_id         INTEGER NOT NULL,
-                data_category_id INTEGER NOT NULL,
-                FOREIGN KEY (dataset_id) REFERENCES datasets (id),
-                FOREIGN KEY (image_id) REFERENCES images (id),
-                FOREIGN KEY (data_category_id) REFERENCES data_categories (id),
-                UNIQUE (dataset_id, image_id)
-            );
-            """
-        )
-
-    def create_normalization_data_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS normalization_data
-            (
-                id           Integer NOT NULL PRIMARY KEY AUTOINCREMENT,
-                dataset_id   INTEGER NOT NULL UNIQUE,
-                mean_ch_0    FLOAT   NOT NULL,
-                mean_ch_1    FLOAT   NOT NULL,
-                mean_ch_2    FLOAT   NOT NULL,
-                std_dev_ch_0 FLOAT   NOT NULL,
-                std_dev_ch_1 FLOAT   NOT NULL,
-                std_dev_ch_2 FLOAT   NOT NULL,
-                FOREIGN KEY (dataset_id) REFERENCES datasets (id)
-            );
-            """
-        )
-
-    def create_model_states_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS model_states
-            (
-                id                 INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                dataset_id         INTEGER NOT NULL,
-                model_type         TEXT    NOT NULL,
-                optimizer_type     TEXT    NOT NULL,
-                lr_scheduler_type  TEXT    NOT NULL,
-                epochs_trained     INTEGER NOT NULL,
-                timestamp          TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                model_state        BLOB    NOT NULL,
-                optimizer_state    BLOB    NOT NULL,
-                lr_scheduler_state BLOB    NOT NULL,
-                FOREIGN KEY (dataset_id) REFERENCES datasets (id)
-            );
-            """
-        )
-
-    create_data_origin(cursor)
-    create_video_table(cursor)
-    create_image_table(cursor)
-    create_video_frame_table(cursor)
-    create_labels_table(cursor)
-    create_annotations_table(cursor)
-    create_datasets_table(cursor)
-    create_data_categories_table(cursor)
-    create_data_subsets_table(cursor)
-    create_normalization_data_table(cursor)
-    create_model_states_table(cursor)
 
 
 if __name__ == "__main__":

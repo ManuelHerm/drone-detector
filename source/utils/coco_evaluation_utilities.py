@@ -8,17 +8,16 @@ import tqdm
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-import configuration
-import database_manager as dbm
-import datatypes as dt
-import locations as loc
-from cache import get_cache
-from logger import logging
+from source.config import locations, settings
+from source.data import datatypes as dt
+from source.data.cache import get_cache
+from source.db import database_manager as dbm
+from source.utils.logger import logging
 
-coco_annotations_cache = get_cache(loc.Cache.coco_annotations)
+coco_annotations_cache = get_cache(locations.Cache.coco_annotations)
 
 log = logging.getLogger(__name__)
-log.setLevel(configuration.LOG_LEVEL)
+log.setLevel(settings.LOG_LEVEL)
 
 # pylint: disable=no-value-for-parameter
 #         Disabled, because the dbm-function receive the
@@ -26,6 +25,12 @@ log.setLevel(configuration.LOG_LEVEL)
 
 
 def get_category_data() -> tuple[dt.CocoCategory, ...]:
+    """
+    Get the available labels from the database in COCO category format.
+
+    Returns:
+        All labels in the database.
+    """
     log.debug("Creating the CocoCategories ...")
     label_list = []
     for label in dbm.get_labels():
@@ -36,6 +41,15 @@ def get_category_data() -> tuple[dt.CocoCategory, ...]:
 
 
 def get_annotation_data(image_id_list: list[int]) -> tuple[dt.CocoAnnotation, ...]:
+    """
+    Get all annotations from the database for the given image ids.
+
+    Args:
+        image_id_list: The ids of the images to get annotations for.
+
+    Returns:
+        All annotations for the images in `image_id_list` in CocoAnnotation format
+    """
     log.debug("Creating the CocoAnnotations ...")
     annotation_list: list[dt.CocoAnnotation] = []
     for image_id in tqdm.tqdm(image_id_list):
@@ -60,6 +74,16 @@ def get_annotation_data(image_id_list: list[int]) -> tuple[dt.CocoAnnotation, ..
 
 
 def get_image_data(image_id_list: list[int]) -> tuple[dt.CocoImage, ...]:
+    """
+    Get all image meta-information from the database for the given
+    image ids in CocoImage format.
+
+    Args:
+        image_id_list: The ids of the images to get meta-information for.
+
+    Returns:
+        All meta-data for the images in `image_id_list`
+    """
     log.debug("Creating the CocoImages ...")
     image_list: list[dt.CocoImage] = []
     for image_id in tqdm.tqdm(image_id_list):
@@ -74,7 +98,8 @@ def get_coco_dataset(dataset_name: str, data_category: str) -> dt.CocoDataset:
     """
     Generate a CocoDataset object.
 
-    It can be used to create the json file for the evaluation with the pycocotools library.
+    It can be used to create the json file for the evaluation with
+    the pycocotools library.
 
     Args:
         dataset_name: The name of the dataset in the database
@@ -105,6 +130,16 @@ def get_coco_dataset(dataset_name: str, data_category: str) -> dt.CocoDataset:
 def create_coco_ground_truth_json(
     dataset_name: str, data_category: str, ground_truth_json: Path
 ):
+    """
+    Get ground truth data for `dataset_name` and `data_category`
+    from database and write COCO json.
+
+    Args:
+        dataset_name: Dataset name in database to create the COCO ground truth for
+        data_category: The data category (training, validation, or testing)
+            from the dataset
+        ground_truth_json: The target file
+    """
     coco_ground_truth = get_coco_dataset(
         dataset_name=dataset_name, data_category=data_category
     )
@@ -126,6 +161,11 @@ def evaluate_model_on_ground_truth(
         The Average Precision @ Intersection over Union of 0.5 (AP@IoU=0.5)
     """
     coco_ground_truth = COCO(ground_truth_json)
+    with open(detection_json, "r", encoding="utf-8") as f:
+        detection_results = json.load(f)
+    if not detection_results:
+        print("No detection results found.")
+        return 0.0
     coco_detections = coco_ground_truth.loadRes(str(detection_json))
     coco_eval = COCOeval(
         cocoGt=coco_ground_truth, cocoDt=coco_detections, iouType="bbox"

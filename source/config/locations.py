@@ -6,7 +6,7 @@ from pathlib import Path
 # pylint: disable=missing-class-docstring
 #         The classes are trivial
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parents[2]
 DB_PATH = ROOT_DIR / "data" / "data.db"
 CACHE_DIR = ROOT_DIR / "cache"
 RESULTS_DIR = ROOT_DIR / "results"
@@ -68,6 +68,7 @@ class Cache:
 
 @dataclass
 class Logs:
+    logs: Path = ROOT_DIR / "logs"
     training: Path = ROOT_DIR / "logs" / "training"
     validation: Path = ROOT_DIR / "logs" / "validation"
 
