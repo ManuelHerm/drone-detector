@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,12 +78,31 @@ class Annotation:
     def get_area(self) -> float:
         return (self.x_max - self.x_min) * (self.y_max - self.y_min)
 
+    @staticmethod
+    def from_json_dict(json_dict) -> Annotation:
+        return Annotation(
+            image_id=json_dict["image_id"],
+            label_id=json_dict["category_id"],
+            x_min=json_dict["bbox"][0],
+            y_min=json_dict["bbox"][1],
+            x_max=json_dict["bbox"][0] + json_dict["bbox"][2],
+            y_max=json_dict["bbox"][1] + json_dict["bbox"][3],
+            id=-1,
+            score=json_dict["score"],
+        )
 
-@dataclass
-class NormalizationData:
-    dataset_id: int
-    mean: tuple[float, float, float]
-    std: tuple[float, float, float]
+    def to_coco_dict(self):
+        return {
+            "image_id": self.image_id,
+            "category_id": 1,
+            "bbox": [
+                self.x_min,
+                self.y_min,
+                self.x_max - self.x_min,
+                self.y_max - self.y_min,
+            ],
+            "score": self.score,
+        }
 
 
 @dataclass
@@ -124,6 +144,17 @@ class CocoAnnotation:
         )
         self.category_id = annotation.label_id
         self.score = score
+
+    def to_annotation(self) -> Annotation:
+        return Annotation(
+            image_id=self.image_id,
+            label_id=self.category_id,
+            x_min=int(self.bbox[0]),
+            y_min=int(self.bbox[1]),
+            x_max=int(self.bbox[0] + self.bbox[2]),
+            y_max=int(self.bbox[1] + self.bbox[3]),
+            score=self.score,
+        )
 
 
 @dataclass
@@ -167,6 +198,17 @@ class CocoPredictionEntry:
     category_id: int
     bbox: tuple[float, float, float, float]  # x, y, w, h
     score: float
+
+    def to_annotation(self) -> Annotation:
+        return Annotation(
+            image_id=self.image_id,
+            label_id=self.category_id,
+            x_min=int(self.bbox[0]),
+            y_min=int(self.bbox[1]),
+            x_max=int(self.bbox[0] + self.bbox[2]),
+            y_max=int(self.bbox[1] + self.bbox[3]),
+            score=self.score,
+        )
 
 
 @dataclass

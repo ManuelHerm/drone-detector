@@ -141,24 +141,6 @@ def initialize_database(cursor: sqlite3.Cursor):
             """
         )
 
-    def create_normalization_data_table(cur: sqlite3.Cursor):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS normalization_data
-            (
-                id           Integer NOT NULL PRIMARY KEY AUTOINCREMENT,
-                dataset_id   INTEGER NOT NULL UNIQUE,
-                mean_ch_0    FLOAT   NOT NULL,
-                mean_ch_1    FLOAT   NOT NULL,
-                mean_ch_2    FLOAT   NOT NULL,
-                std_dev_ch_0 FLOAT   NOT NULL,
-                std_dev_ch_1 FLOAT   NOT NULL,
-                std_dev_ch_2 FLOAT   NOT NULL,
-                FOREIGN KEY (dataset_id) REFERENCES datasets (id)
-            );
-            """
-        )
-
     def create_model_states_table(cur: sqlite3.Cursor):
         cur.execute(
             """
@@ -189,5 +171,4 @@ def initialize_database(cursor: sqlite3.Cursor):
     create_datasets_table(cursor)
     create_data_categories_table(cursor)
     create_data_subsets_table(cursor)
-    create_normalization_data_table(cursor)
     create_model_states_table(cursor)

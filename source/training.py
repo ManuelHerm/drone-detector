@@ -4,13 +4,14 @@ This module facilitates the model training.
 
 from io import BytesIO
 
-import torch as th
+import torch
 import tqdm
 
-from source import datasets, models
+from source import datasets, models, quality_test
 from source.config import names, settings
 from source.data import datatypes as dt
 from source.db import database_manager as dbm
+from source.utils import dataset_utilities
 from source.utils.convergance_monitor import ConvergenceMonitor
 from source.utils.logger import logging
 
@@ -22,232 +23,267 @@ log.setLevel(settings.LOG_LEVEL)
 #         cursor parameter from the decorator.
 
 
-def train_one_epoch(training_model, data_loader, optim, lr_scheduler, conv_monitor):
-    training_model.train()
-    for images, targets in tqdm.tqdm(data_loader):
-        # Moving input to the right device:
-        images = list(image.to(device=settings.DEVICE) for image in images)
-        targets = [
-            {key: value.to(device=settings.DEVICE) for key, value in target.items()}
-            for target in targets
+class Trainer:
+
+    def __init__(self, dataset_name: str, from_model_state: int = -1):
+
+        # Dataloader
+        # ----------
+
+        self.training_loader = datasets.get_dataloader(
+            dataset_name=dataset_name,
+            data_category_names=[
+                names.DataCategoryNames.training,
+                names.DataCategoryNames.validation,
+            ],
+            augment=True,
+            get_untransformed_func=datasets.get_untransformed_uncached_function,
+        )
+        self.dataset_id = dbm.get_dataset_id_for_dataset_name(dataset_name=dataset_name)
+
+        # Model
+        # -----
+        if from_model_state != -1:
+            self.model = models.restore_model_state(from_model_state)
+            self.model_state = from_model_state
+        else:
+            self.model = models.get_faster_r_cnn_model(
+                settings.NUM_CLASSES, settings.MODEL_KWARGS
+            )
+
+        # Optimizer Setup
+        # ---------------
+
+        # Parameter splitting
+        backbone_params = []
+        head_params = []
+
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "backbone" in name:
+                if settings.TRAIN_BACKBONE:
+                    backbone_params.append(p)
+                else:
+                    p.requires_grad = False
+            else:
+                head_params.append(p)
+
+        # Learning rate assignment for ...
+        # 1) Head parameters:
+        optimizer_learning_rates = [
+            {"params": head_params, "lr": settings.BASE_LR_HEADS}
         ]
-        # Computing the loss
-        loss_dict = training_model(images, targets)
-        losses = sum(individual_loss for individual_loss in loss_dict.values())
-        # Resetting the gradients
-        optim.zero_grad()
-        # Backpropagation
-        losses.backward()
-        # Applying the changes
-        optim.step()
-        # Updating the learning rates
-        lr_scheduler.step()
-        # Monitoring
-        with th.no_grad():
-            conv_monitor.add_training_point_per_batch(
-                dt.FasterRCNNLoss(
-                    box_reg=loss_dict["loss_box_reg"].detach().cpu().item(),
-                    classifier=loss_dict["loss_classifier"].detach().cpu().item(),
-                    objectness=loss_dict["loss_objectness"].detach().cpu().item(),
-                    rpn_box_reg=loss_dict["loss_rpn_box_reg"].detach().cpu().item(),
-                ),
-                len(images),
+        # 2) Backbone parameters:
+        if settings.TRAIN_BACKBONE:
+            optimizer_learning_rates.append(
+                {"params": backbone_params, "lr": settings.BASE_LR_BACKBONE}
             )
-        # Emptying the memory for the next cycle
-        del images
-        del targets
-        del loss_dict
-        del losses
-        if settings.DEVICE == "cuda":
-            th.cuda.empty_cache()
 
+        # Optimizer
+        self.optimizer = torch.optim.SGD(
+            optimizer_learning_rates,
+            momentum=settings.OPTIMIZIER_MOMENTUM,
+            weight_decay=settings.OPTIMIZIER_WEIGHT_DECAY,
+            nesterov=settings.OPTIMIZER_NESTEROV,
+        )
+        if from_model_state != -1:
+            optim_state_dict = torch.load(
+                f=BytesIO(dbm.get_optimizer_state(model_state_id=from_model_state)),
+                map_location=settings.DEVICE,
+            )
+            self.optimizer.load_state_dict(optim_state_dict)
 
-def validate_one_epoch(validation_model, data_loader, conv_monitor):
-    with th.no_grad():
-        validation_model.train()
-        for images, targets in tqdm.tqdm(data_loader):
-            # Moving input to the right device:
-            images = list(image.to(device=settings.DEVICE) for image in images)
-            targets = [
-                {key: value.to(device=settings.DEVICE) for key, value in target.items()}
-                for target in targets
-            ]
-            # Computing the loss
-            loss_dict = validation_model(images, targets)
-            conv_monitor.add_validation_point_per_batch(
-                dt.FasterRCNNLoss(
-                    box_reg=loss_dict["loss_box_reg"].detach().cpu().item(),
-                    classifier=loss_dict["loss_classifier"].detach().cpu().item(),
-                    objectness=loss_dict["loss_objectness"].detach().cpu().item(),
-                    rpn_box_reg=loss_dict["loss_rpn_box_reg"].detach().cpu().item(),
+        # Tracking
+        # --------
+
+        if from_model_state != -1:
+            self.batches_trained, self.epochs_trained, self.samples_trained = (
+                dbm.get_training_metrics(model_state_id=from_model_state)
+            )
+        else:
+            self.batches_trained = 0
+            self.epochs_trained = 0
+            self.samples_trained = 0
+        self.lr_history = []  # list of (global_step, [lr_group0, lr_group1, ...])
+
+        # Learning rate schedulers
+        # ------------------------
+
+        # Warmup
+        self.warmup_batches = min(
+            settings.WARMUP_BATCHES, len(self.training_loader) - 1
+        )
+        self.warmup_lr_scheduler = None
+        if self.batches_trained < self.warmup_batches:
+            self.warmup_lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=settings.WARMUP_FACTOR,
+                total_iters=self.warmup_batches,
+            )
+            if from_model_state != -1:
+                warmup_state_dict = torch.load(
+                    f=BytesIO(dbm.get_lr_warmup_state(state_id=from_model_state)),
+                    map_location=settings.DEVICE,
                 )
+                self.warmup_lr_scheduler.load_state_dict(warmup_state_dict)
+
+        # Main
+        self.main_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            self.optimizer,
+            milestones=settings.MAIN_LR_MILESTONES,
+            gamma=settings.MAIN_LR_GAMMA,
+        )
+        if from_model_state != -1:
+            main_lr_state_dict = torch.load(
+                f=BytesIO(dbm.get_lr_main_state(state_id=from_model_state)),
+                map_location=settings.DEVICE,
+            )
+            self.main_lr_scheduler.load_state_dict(main_lr_state_dict)
+
+        # Convergence Monitor
+        # -------------------
+
+        self.convergence_monitor = ConvergenceMonitor(
+            number_of_samples=self.samples_trained
+        )
+
+    def _store_lrs(self):
+        self.lr_history.append(
+            (
+                self.batches_trained,
+                tuple(float(pg["lr"]) for pg in self.optimizer.param_groups),
+            )
+        )
+
+    def _print_backbone_in_optimizer(self):
+        backbone_param_ids = {id(p) for p in self.model.backbone.parameters()}
+        opt_param_ids = {
+            id(p) for g in self.optimizer.param_groups for p in g["params"]
+        }
+        in_opt = len(backbone_param_ids & opt_param_ids) > 0
+        log.info(
+            "Backbone is in optimizer." if in_opt else "Backbone is not in optimizer."
+        )
+
+    def print_learning_rates(self):
+        for batch_nr, (lr_1, lr_2) in self.lr_history:
+            print(f"{batch_nr:03}: {lr_1:0.3e} {lr_2:0.3e}")
+
+    def train(self) -> int:
+        log.info("Training on %s", settings.DEVICE)
+
+        self._print_backbone_in_optimizer()
+
+        for epoch in range(self.epochs_trained, settings.EPOCHS):
+            self.model.train()
+            log.info("Epoch number: %s", epoch)
+
+            log.info(
+                "Learning rates for batch %s: %0.3e, %0.3e",
+                self.batches_trained,
+                self.optimizer.param_groups[0]["lr"],
+                (
+                    self.optimizer.param_groups[1]["lr"]
+                    if settings.TRAIN_BACKBONE
+                    else 0.0
+                ),
             )
 
+            for images, targets in tqdm.tqdm(self.training_loader):
 
-def train_on_cranfield_default():
-    log.info("Training on %s", settings.DEVICE)
-    model = models.get_faster_r_cnn_model(num_classes=settings.NUM_CLASSES)
-    training_loader = datasets.get_cranfield_default_dataloader_training()
-    validation_loader = datasets.get_cranfield_default_dataloader_validation(
-        normalization_data_id=dbm.get_normalization_data_for_dataset_id(
-            dbm.get_dataset_id_for_dataset_name(names.DatasetNames.cranfield_default)
-        )
-    )
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = th.optim.SGD(
-        params, lr=settings.LEARNING_RATE, momentum=0.9, weight_decay=0.0005
-    )
-    learning_rate_scheduler = th.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1.0 / 1000.0,
-        total_iters=min(1000, len(training_loader) - 1),
-    )
-    convergence_monitor = ConvergenceMonitor()
-    for epoch in range(settings.EPOCHS):
-        log.info("Epoch number: %s", epoch)
-        train_one_epoch(
-            model,
-            training_loader,
-            optimizer,
-            learning_rate_scheduler,
-            convergence_monitor,
-        )
-        epochs_trained = epoch + 1
-        if epochs_trained % 10 == 0:
-            models.save_progress(
-                model_to_save=model,
-                optimizer_to_save=optimizer,
-                lr_scheduler_to_save=learning_rate_scheduler,
-                epochs_trained=epochs_trained,
-                dataset_id=training_loader.dataset.dataset_id,
-            )
-        convergence_monitor.add_training_point_per_epoch()
-        validate_one_epoch(model, validation_loader, convergence_monitor)
-        convergence_monitor.add_validation_point_per_epoch()
+                self._store_lrs()
 
+                # Moving input to the right device:
+                images = list(image.to(device=settings.DEVICE) for image in images)
+                targets = [
+                    {
+                        key: value.to(device=settings.DEVICE)
+                        for key, value in target.items()
+                    }
+                    for target in targets
+                ]
 
-def train_on_cranfield_combined():
-    log.info("Training on %s", settings.DEVICE)
-    model = models.get_faster_r_cnn_model(num_classes=settings.NUM_CLASSES)
-    training_loader = datasets.get_dataloader(
-        dataset_name=names.DatasetNames.cranfield_combined,
-        data_category_name=names.DataCategoryNames.training,
-        augment=True,
-        get_untransformed_func=datasets.get_untransformed_uncached_function,
-    )
-    validation_loader = datasets.get_dataloader(
-        dataset_name=names.DatasetNames.cranfield_combined,
-        data_category_name=names.DataCategoryNames.validation,
-        augment=False,
-        get_untransformed_func=datasets.get_untransformed_uncached_function,
-    )
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = th.optim.SGD(
-        params, lr=settings.LEARNING_RATE, momentum=0.9, weight_decay=0.0005
-    )
-    learning_rate_scheduler = th.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1.0 / 1000.0,
-        total_iters=min(1000, len(training_loader) - 1),
-    )
-    convergence_monitor = ConvergenceMonitor()
-    for epoch in range(settings.EPOCHS):
-        log.info("Epoch number: %s", epoch)
-        train_one_epoch(
-            model,
-            training_loader,
-            optimizer,
-            learning_rate_scheduler,
-            convergence_monitor,
-        )
-        epochs_trained = epoch + 1
-        if epochs_trained % 10 == 0:
-            models.save_progress(
-                model_to_save=model,
-                optimizer_to_save=optimizer,
-                lr_scheduler_to_save=learning_rate_scheduler,
-                epochs_trained=epochs_trained,
-                dataset_id=training_loader.dataset.dataset_id,
-            )
-        convergence_monitor.add_training_point_per_epoch()
-        validate_one_epoch(model, validation_loader, convergence_monitor)
-        convergence_monitor.add_validation_point_per_epoch()
+                # Computing the loss
+                loss_dict = self.model(images, targets)
+                losses = sum(individual_loss for individual_loss in loss_dict.values())
 
+                # Resetting the gradients
+                self.optimizer.zero_grad()
 
-def continue_to_train_on_cranfield_combined(model_state_id: int):
-    log.info("Training on %s", settings.DEVICE)
+                # Backpropagation
+                losses.backward()
 
-    # Restoring model from database
-    model = models.get_faster_r_cnn_model(num_classes=settings.NUM_CLASSES)
-    state_dict = th.load(
-        f=BytesIO(dbm.get_model_state(model_state_id=model_state_id)),
-        map_location=settings.DEVICE,
-    )
-    model.load_state_dict(state_dict)
+                # Applying the changes
+                self.optimizer.step()
 
-    training_loader = datasets.get_dataloader(
-        dataset_name=names.DatasetNames.cranfield_combined,
-        data_category_name=names.DataCategoryNames.training,
-        augment=True,
-        get_untransformed_func=datasets.get_untransformed_uncached_function,
-    )
-    validation_loader = datasets.get_dataloader(
-        dataset_name=names.DatasetNames.cranfield_combined,
-        data_category_name=names.DataCategoryNames.validation,
-        augment=False,
-        get_untransformed_func=datasets.get_untransformed_uncached_function,
-    )
+                # Updating the learning rates (warmup)
+                if self.warmup_lr_scheduler is not None:
+                    if self.batches_trained < self.warmup_batches:
+                        self.warmup_lr_scheduler.step()
 
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = th.optim.SGD(
-        params, lr=settings.LEARNING_RATE, momentum=0.9, weight_decay=0.0005
-    )
-    optim_state_dict = th.load(
-        f=BytesIO(dbm.get_optimizer_state(model_state_id=model_state_id)),
-        map_location=settings.DEVICE,
-    )
-    optimizer.load_state_dict(optim_state_dict)
+                # Monitoring
+                self.batches_trained += 1
+                self.samples_trained += len(images)
+                self.convergence_monitor.add_training_point_per_batch(
+                    dt.FasterRCNNLoss(
+                        box_reg=loss_dict["loss_box_reg"].detach().cpu().item(),
+                        classifier=loss_dict["loss_classifier"].detach().cpu().item(),
+                        objectness=loss_dict["loss_objectness"].detach().cpu().item(),
+                        rpn_box_reg=loss_dict["loss_rpn_box_reg"].detach().cpu().item(),
+                    ),
+                    samples_trained_in_batch=len(images),
+                )
 
-    learning_rate_scheduler = th.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1.0 / 1000.0,
-        total_iters=min(1000, len(training_loader) - 1),
-    )
-    lr_scheduler_state_dict = th.load(
-        f=dbm.get_learning_rate_scheduler_state(state_id=model_state_id),
-        map_location=settings.DEVICE,
-    )
-    learning_rate_scheduler.load_state_dict(lr_scheduler_state_dict)
+                # Emptying the memory for the next cycle
+                del images
+                del targets
+                del loss_dict
+                del losses
 
-    convergence_monitor = ConvergenceMonitor(
-        number_of_samples=dbm.get_samples_trained(model_state_id=model_state_id)
-    )
+            # Updating the learning rates (main)
+            self.main_lr_scheduler.step()
 
-    epochs_trained = dbm.get_epochs_trained(model_state_id=model_state_id)
+            self.epochs_trained += 1
 
-    for epoch in range(epochs_trained, settings.EPOCHS):
-        log.info("Epoch number: %s", epoch)
-        train_one_epoch(
-            model,
-            training_loader,
-            optimizer,
-            learning_rate_scheduler,
-            convergence_monitor,
-        )
-        epochs_trained = epoch + 1
-        if epochs_trained % 5 == 0:
-            models.save_progress(
-                model_to_save=model,
-                optimizer_to_save=optimizer,
-                lr_scheduler_to_save=learning_rate_scheduler,
-                epochs_trained=epochs_trained,
-                dataset_id=training_loader.dataset.dataset_id,
-                samples_trained=convergence_monitor.number_of_samples,
-            )
-        convergence_monitor.add_training_point_per_epoch()
-        validate_one_epoch(model, validation_loader, convergence_monitor)
-        convergence_monitor.add_validation_point_per_epoch()
+            # Saving the status
+            if self.epochs_trained % settings.SAVING_FREQUENCY == 0:
+                self.model_state = dbm.insert_model_state(
+                    dataset_id=self.dataset_id,
+                    model_state=models.save_torch_state(self.model),
+                    optimizer_state=models.save_torch_state(self.optimizer),
+                    warmup_lr_scheduler_state=models.save_torch_state(
+                        self.warmup_lr_scheduler
+                    ),
+                    main_lr_scheduler_state=models.save_torch_state(
+                        self.main_lr_scheduler
+                    ),
+                    epochs_trained=self.epochs_trained,
+                    samples_trained=self.samples_trained,
+                    batches_trained=self.batches_trained,
+                    model_setting=settings.MODEL_KWARGS,
+                )
+
+            # Convergence monitor udpate
+            self.convergence_monitor.add_training_point_per_epoch()
+            if self.epochs_trained % settings.VALIDATION_FREQUENCY == 0:
+                self.convergence_monitor.add_dvb_ap05_per_epoch(
+                    quality_test.create_ap05_for_dataset(
+                        model_to_check=self.model,
+                        dataset_names=names.DroneVsBirdVideos.validation_videos,
+                        model_state_id=self.model_state,
+                    )
+                )
+        return self.model_state
 
 
 if __name__ == "__main__":
-    continue_to_train_on_cranfield_combined(model_state_id=77)
+    trainer = Trainer(
+        dataset_name=names.DatasetNames.optimization_3,
+    )
+    last_model_state = trainer.train()
+    print(f"{last_model_state = }")
+    quality_test.create_ap05_json_for_dataset(
+        model_state_id=last_model_state,
+        dataset_names=names.DroneVsBirdVideos.video_names,
+    )

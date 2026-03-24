@@ -4,17 +4,24 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import tqdm
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-from source.config import locations, settings
+from source.config import locations, names, settings
 from source.data import datatypes as dt
 from source.data.cache import get_cache
 from source.db import database_manager as dbm
 from source.utils.logger import logging
 
 coco_annotations_cache = get_cache(locations.Cache.coco_annotations)
+
+mpl.rcParams["figure.dpi"] = 600
+plt.style.use("seaborn-v0_8")
 
 log = logging.getLogger(__name__)
 log.setLevel(settings.LOG_LEVEL)
@@ -88,13 +95,18 @@ def get_image_data(image_id_list: list[int]) -> tuple[dt.CocoImage, ...]:
     image_list: list[dt.CocoImage] = []
     for image_id in tqdm.tqdm(image_id_list):
         width, height = dbm.get_image_width_and_height_for_image_id(image_id=image_id)
-        image = dt.CocoImage(id=image_id, width=width, height=height)
+        image = dt.CocoImage(
+            id=image_id,
+            width=width,
+            height=height,
+            file_name=dbm.get_image_name_for_image_id(image_id),
+        )
         image_list.append(image)
     return tuple(image_list)
 
 
-@coco_annotations_cache.memoize(typed=True)
-def get_coco_dataset(dataset_name: str, data_category: str) -> dt.CocoDataset:
+# @coco_annotations_cache.memoize(typed=True)
+def get_coco_dataset(dataset_name: str, data_category: str = "") -> dt.CocoDataset:
     """
     Generate a CocoDataset object.
 
@@ -111,13 +123,15 @@ def get_coco_dataset(dataset_name: str, data_category: str) -> dt.CocoDataset:
     log.info("Creating '%s' %s CocoDataset", dataset_name, data_category)
 
     dataset_id = dbm.get_dataset_id_for_dataset_name(dataset_name=dataset_name)
-    data_category_id = dbm.get_data_category_id_for_name(name=data_category)
 
     log.debug("Getting the image id list ...")
-    image_ids = dbm.get_image_ids_for_data_category_and_dataset_id(
-        dataset_id=dataset_id, data_category_id=data_category_id
-    )
-
+    if data_category == "":
+        image_ids = dbm.get_image_ids_for_dataset_id(dataset_id=dataset_id)
+    else:
+        data_category_id = dbm.get_data_category_id_for_name(name=data_category)
+        image_ids = dbm.get_image_ids_for_data_category_and_dataset_id(
+            dataset_id=dataset_id, data_category_id=data_category_id
+        )
     return dt.CocoDataset(
         info=dt.CocoInfo(description=dataset_name),
         images=get_image_data(image_id_list=image_ids),
@@ -128,7 +142,7 @@ def get_coco_dataset(dataset_name: str, data_category: str) -> dt.CocoDataset:
 
 
 def create_coco_ground_truth_json(
-    dataset_name: str, data_category: str, ground_truth_json: Path
+    dataset_name: str, ground_truth_json: Path, data_category: str = ""
 ):
     """
     Get ground truth data for `dataset_name` and `data_category`
@@ -143,12 +157,26 @@ def create_coco_ground_truth_json(
     coco_ground_truth = get_coco_dataset(
         dataset_name=dataset_name, data_category=data_category
     )
+    if not ground_truth_json.parent.exists():
+        ground_truth_json.parent.mkdir(parents=True)
     with open(ground_truth_json, "w", encoding="utf-8") as f:
         json.dump(asdict(coco_ground_truth), f)
 
 
+def get_rec_prec_file_name(coco_file_name: Path) -> Path:
+    file_name = (
+        f"{coco_file_name.stem}_"
+        "rec_prec_"
+        f"conf_{settings.BOX_SCORE_THRESH:0.2f}_"
+        f"nms_{settings.BOX_NMS_THRESH:0.2f}"
+        ".json"
+    )
+    return coco_file_name.parent / file_name
+
+
 def evaluate_model_on_ground_truth(
-    detection_json: Path, ground_truth_json: Path
+    detection_json: Path,
+    ground_truth_json: Path,
 ) -> float:
     """
     Runs the COCO evaluation.
@@ -170,7 +198,109 @@ def evaluate_model_on_ground_truth(
     coco_eval = COCOeval(
         cocoGt=coco_ground_truth, cocoDt=coco_detections, iouType="bbox"
     )
+    # Restrict the evaluation to IoU = 0.5
+    coco_eval.params.iouThrs = np.array([0.5])
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
+
+    p = coco_eval.params
+
+    iouThr = 0.50
+    areaLbl = "all"
+    maxDets = 100
+    catId = 1  # = drone
+
+    # indices
+    t = np.where(np.isclose(p.iouThrs, iouThr))[0]
+    a = [i for i, l in enumerate(p.areaRngLbl) if l == areaLbl][0]
+    m = [i for i, d in enumerate(p.maxDets) if d == maxDets][0]
+    k = [i for i, cid in enumerate(p.catIds) if cid == catId][0]
+
+    rec = p.recThrs  # (R,)
+    prec = coco_eval.eval["precision"][t, :, k, a, m].squeeze()  # (R,)
+
+    save_curve = {
+        "name": detection_json.stem,
+        "nms_threshold": settings.BOX_NMS_THRESH,
+        "score_threshold": settings.BOX_SCORE_THRESH,
+        "recall": rec.tolist(),
+        "precision": prec.tolist(),
+    }
+
+    with open(get_rec_prec_file_name(detection_json), mode="w", encoding="utf-8") as f:
+        json.dump(save_curve, f, indent=True)
+
     return coco_eval.stats.tolist()[1]
+
+
+if __name__ == "__main__":
+
+    kwargs = [
+        # {
+        #     "ds_name": names.DatasetNames.forrest_hut_phantom,
+        #     "target_json": locations.ForrestHutPhantom.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.forrest_hut_inspire,
+        #     "target_json": locations.ForrestHutInspire.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.forrest_hut_mini,
+        #     "target_json": locations.ForrestHutMini.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.campus,
+        #     "target_json": locations.Campus.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.hill,
+        #     "target_json": locations.Hill.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.meadow,
+        #     "target_json": locations.Meadow.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.city,
+        #     "target_json": locations.City.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.parrot_one,
+        #     "target_json": locations.ParrotOne.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.parrot_two,
+        #     "target_json": locations.ParrotTwo.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.lake,
+        #     "target_json": locations.Lake.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.disorder_full,
+        #     "target_json": locations.Disorder.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.lanterns_full,
+        #     "target_json": locations.Lanterns.gt,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.twigs_pine,
+        #     "target_json": locations.Trees.gt_pine,
+        # },
+        # {
+        #     "ds_name": names.DatasetNames.twigs_tree,
+        #     "target_json": locations.Trees.gt_tree,
+        # },
+        {
+            "ds_name": names.DatasetNames.container_full,
+            "target_json": locations.Container.gt,
+        },
+    ]
+
+    for kwarg in kwargs:
+        create_coco_ground_truth_json(
+            dataset_name=kwarg["ds_name"],
+            ground_truth_json=kwarg["target_json"],
+        )

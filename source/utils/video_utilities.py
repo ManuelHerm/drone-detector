@@ -88,12 +88,17 @@ def create_video_from_path(path: Path, data_origin_name: str) -> dt.Video:
 def create_video_from_images_in_folder(
     image_folder: Path,
     video_target_path: Path,
-    width: float,
-    height: float,
-    frame_rate: float = 60,
+    width: int,
+    height: int,
+    frame_rate: float,
 ):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # use "XVID" or "avc1" if needed
-    out = cv2.VideoWriter(str(video_target_path), fourcc, frame_rate, (width, height))
+    out = cv2.VideoWriter(
+        filename=str(video_target_path),
+        fourcc=fourcc,
+        fps=frame_rate,
+        frameSize=(width, height),
+    )
 
     for file_name in sorted(image_folder.iterdir()):
         img = cv2.imread(str(file_name), cv2.IMREAD_UNCHANGED)

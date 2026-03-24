@@ -1,14 +1,18 @@
 """Module provides the PyTorch datasets."""
 
 import random
+from pathlib import Path
 from typing import Callable, Sequence, TypeVar
 
-import torch as th
+import torch
+import tqdm
 from torch.utils.data import DataLoader, Dataset
 from torchvision import tv_tensors
 from torchvision.transforms import v2
+from torchvision.transforms.functional import to_pil_image
 
 from source.config import locations, names, settings
+from source.data import datatypes as dt
 from source.data.cache import get_cache
 from source.db import database_manager as dbm
 from source.utils import image_utilities
@@ -75,21 +79,21 @@ def get_untransformed_uncached_function(
     try:
         annotations = dbm.get_annotations_for_image_id(image_id)
         boxes = tv_tensors.BoundingBoxes(
-            th.tensor([[a.x_min, a.y_min, a.x_max, a.y_max] for a in annotations]),
+            torch.tensor([[a.x_min, a.y_min, a.x_max, a.y_max] for a in annotations]),
             format="XYXY",
             canvas_size=(image_tensor.shape[-2], image_tensor.shape[-1]),
         )
-        labels = th.tensor([a.label_id for a in annotations])
+        labels = torch.tensor([a.label_id for a in annotations])
     except IndexError:
         # There are no annotations for the image
         boxes = tv_tensors.BoundingBoxes(
-            th.zeros((0, 4), dtype=th.float32),
+            torch.zeros((0, 4), dtype=torch.float32),
             format="XYXY",
             canvas_size=(image_tensor.shape[-2], image_tensor.shape[-1]),
         )
-        labels = th.zeros((0,), dtype=th.int64)
+        labels = torch.zeros((0,), dtype=torch.int64)
 
-    target = {"boxes": boxes, "labels": labels, "image_id": th.tensor(image_id)}
+    target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor(image_id)}
     return image_tensor, target
 
 
@@ -104,15 +108,11 @@ def get_untransformed_cranfield(
 class DroneDataset(Dataset):
     """Class to provide the drone datasets."""
 
-    # pylint: disable=too-many-arguments
-    # pylint: disable=too-many-positional-arguments
-    #         These arguments are necessary.
     def __init__(
         self,
         dataset_name: str,
-        data_category_name: str,
+        data_category_names: list[str],
         augment: bool,
-        normalization_data_id: int,
         get_untransformed_function: Callable[
             [int], tuple[tv_tensors.Image, dict[str, tv_tensors.TVTensor]]
         ],
@@ -122,25 +122,45 @@ class DroneDataset(Dataset):
 
         Args:
             dataset_name: Name of the dataset.
-            data_category_name: Name of the data category
+            data_category_names: Names of the data categories
                 (like "training" or "validation").
             augment: Whether to augment the data using transforms.
             get_untransformed_function: Function that retrieves untransformed
                 samples from the database.
         """
-        self.data_category_id = dbm.get_data_category_id_for_name(
-            name=data_category_name
-        )
+        self.data_category_ids = [
+            dbm.get_data_category_id_for_name(name=name) for name in data_category_names
+        ]
+
         self.dataset_id = dbm.get_dataset_id_for_dataset_name(dataset_name=dataset_name)
-        self.image_ids = dbm.get_image_ids_for_data_category_and_dataset_id(
-            dataset_id=self.dataset_id, data_category_id=self.data_category_id
-        )
-        normalization_data = dbm.get_normalization_data_for_id(
-            normalization_data_id=normalization_data_id
-        )
+
+        self.image_ids = []
+
+        for data_category_id in self.data_category_ids:
+            self.image_ids.extend(
+                dbm.get_image_ids_for_data_category_and_dataset_id(
+                    dataset_id=self.dataset_id, data_category_id=data_category_id
+                )
+            )
+
         self.augment = augment
-        self.mean = normalization_data.mean
-        self.std = normalization_data.std
+
+        self._aug = v2.Compose(
+            [
+                v2.RandomApply([v2.GaussianNoise(mean=0.0, sigma=0.05)]),
+                v2.RandomPerspective(fill=(0.485, 0.456, 0.406), distortion_scale=0.3),
+                v2.RandomApply([v2.RandomCrop((800, 800))], p=0.2),
+                v2.RandomApply([v2.RandomPhotometricDistort()], p=0.3),
+                v2.RandomHorizontalFlip(p=0.5),  # already random
+                v2.SanitizeBoundingBoxes(min_size=settings.BBOX_MIN_SIZE),
+            ]
+        )
+        self._noaug = v2.Compose(
+            [
+                v2.SanitizeBoundingBoxes(min_size=settings.BBOX_MIN_SIZE),
+            ]
+        )
+
         self.get_untransformed = get_untransformed_function
 
     def __len__(self):
@@ -150,104 +170,16 @@ class DroneDataset(Dataset):
 
     def __getitem__(self, index):
         image, target = self.get_untransformed(self.image_ids[index])
-        chosen_transforms = []
-        if self.augment:
-            shorter_side_length = min(image.cpu().detach().shape[1:])
-            channel_averages = image.mean(dim=(1, 2)).cpu().detach().tolist()
-            transforms_geometry = tuple(
-                [
-                    v2.RandomResize(min_size=600, max_size=shorter_side_length),
-                    v2.RandomCrop(size=(600, 600)),
-                    v2.RandomZoomOut(fill=channel_averages),
-                    v2.RandomPerspective(fill=channel_averages, distortion_scale=0.5),
-                ]
-            )
-            chosen_transforms.extend(random_subset(transforms_geometry))
-            transforms_gauss = tuple(
-                [
-                    v2.GaussianBlur(kernel_size=5, sigma=(0.4, 0.6)),
-                    v2.GaussianNoise(sigma=0.1),
-                ]
-            )
-            chosen_transforms.extend(random_subset(transforms_gauss))
-            transforms_color = tuple([v2.RandomPhotometricDistort()])
-            chosen_transforms.extend(random_subset(transforms_color))
-            transforms_common = tuple([v2.RandomHorizontalFlip()])
-            chosen_transforms.extend(transforms_common)
-        transforms_finish = tuple(
-            [v2.Normalize(mean=self.mean, std=self.std), v2.SanitizeBoundingBoxes()]
-        )
-        chosen_transforms.extend(transforms_finish)
-        transforms = v2.Compose(chosen_transforms)
-        return transforms(image, target)
-
-
-def get_drone_vs_bird_dataloader(normalization_data_id: int):
-    """
-    Initialize the entire Drone vs. Bird DroneDataset and generate dataloader.
-
-    Uses the training data-category.
-    Considers settings from the configuration module.
-
-    Args:
-        normalization_data_id: The id of the normalization data that
-            shall be used for normalization.
-
-    Returns:
-        Drone versus Bird testing dataloader.
-    """
-    dataset = DroneDataset(
-        dataset_name=names.DatasetNames.drone_vs_bird,
-        data_category_name=names.DataCategoryNames.testing,
-        augment=False,
-        normalization_data_id=normalization_data_id,
-        # Cache was gigantic for drone versus bird. Therefore,
-        # the uncached version here.
-        get_untransformed_function=get_untransformed_uncached_function,
-    )
-    return th.utils.data.DataLoader(
-        dataset,
-        batch_size=settings.BATCH_SIZE_TEST,
-        num_workers=settings.NUM_WORKERS_TEST,
-        collate_fn=batch_to_tuple,
-        pin_memory=True,
-    )
-
-
-def get_cranfield_default_dataloader_training() -> DataLoader:
-    """
-    Initialize the CranfieldDataset for training and generate dataloader.
-
-    Considers settings from the configuration module.
-
-    Returns:
-        Cranfield training dataloader.
-    """
-    dataset = DroneDataset(
-        dataset_name=names.DatasetNames.cranfield_default,
-        data_category_name=names.DataCategoryNames.training,
-        augment=True,
-        normalization_data_id=dbm.get_normalization_data_id_for_dataset_id(
-            dbm.get_dataset_id_for_dataset_name(names.DatasetNames.cranfield_default)
-        ),
-        get_untransformed_function=get_untransformed_cranfield,
-    )
-    return th.utils.data.DataLoader(
-        dataset,
-        batch_size=settings.BATCH_SIZE_TRAIN,
-        num_workers=settings.NUM_WORKERS_TRAIN,
-        collate_fn=batch_to_tuple,
-        pin_memory=True,
-    )
+        return (self._aug if self.augment else self._noaug)(image, target)
 
 
 def get_dataloader(
     dataset_name: str,
-    data_category_name: str,
+    data_category_names: list[str],
     augment: bool,
     get_untransformed_func: Callable[
         [int], tuple[tv_tensors.Image, dict[str, tv_tensors.TVTensor]]
-    ],
+    ] = get_untransformed_uncached_function,
 ) -> DataLoader:
     """
     Initialize the dataset and generate dataloader.
@@ -259,88 +191,61 @@ def get_dataloader(
     """
     dataset = DroneDataset(
         dataset_name=dataset_name,
-        data_category_name=data_category_name,
+        data_category_names=data_category_names,
         augment=augment,
-        normalization_data_id=dbm.get_normalization_data_id_for_dataset_id(
-            dbm.get_dataset_id_for_dataset_name(dataset_name)
-        ),
         get_untransformed_function=get_untransformed_func,
     )
-    return th.utils.data.DataLoader(
+    return torch.utils.data.DataLoader(
         dataset,
         batch_size=settings.BATCH_SIZE_TRAIN,
         num_workers=settings.NUM_WORKERS_TRAIN,
         collate_fn=batch_to_tuple,
         pin_memory=True,
+        shuffle=True,
     )
 
 
-def get_cranfield_default_dataloader_validation(
-    normalization_data_id: int,
-) -> DataLoader:
-    """
-    Initialize the CranfieldDataset for validation and generate dataloader.
-
-    Considers settings from the configuration module.
-
-    Args:
-        normalization_data_id: The id of the normalization data that
-            shall be used for normalization.
-
-    Returns:
-        Cranfield validation dataloader.
-    """
-    dataset = DroneDataset(
-        dataset_name=names.DatasetNames.cranfield_default,
-        data_category_name=names.DataCategoryNames.validation,
-        augment=False,
-        normalization_data_id=normalization_data_id,
-        get_untransformed_function=get_untransformed_cranfield,
+@torch.inference_mode()
+def save_training_sample(
+    image: tv_tensors.Image,
+    bounding_boxes: tv_tensors.BoundingBoxes,
+    image_id: torch.Tensor,
+    target_path: Path,
+):
+    pil_image = to_pil_image(image)
+    image_id_int = int(image_id.detach().to("cpu").item())
+    annotations = []
+    for box in bounding_boxes:
+        annotation = dt.Annotation(
+            image_id=image_id_int,
+            label_id=1,
+            x_min=int(box[0].detach().to("cpu").item()),
+            y_min=int(box[1].detach().to("cpu").item()),
+            x_max=int(box[2].detach().to("cpu").item()),
+            y_max=int(box[3].detach().to("cpu").item()),
+            id=-1,
+        )
+        annotations.append(annotation)
+    sample_image = image_utilities.add_bounding_boxes_to_image(
+        img=pil_image,
+        bboxes=annotations,
+        legend_entry=dt.ImageLegendEntry(xy=(10, 10), text=f"{image_id_int = }"),
     )
-    return th.utils.data.DataLoader(
-        dataset,
-        batch_size=settings.BATCH_SIZE_TEST,
-        num_workers=settings.NUM_WORKERS_TEST,
-        collate_fn=batch_to_tuple,
-        pin_memory=True,
-    )
-
-
-def get_drone_vs_bird_single_video_dataloader(
-    video_name: str, normalization_data_id: int
-) -> DataLoader:
-    """
-    Initialize a Drone vs. Bird dataset for testing and generate dataloader.
-
-    Considers settings from the configuration module for:
-
-    - Batch size
-    - Number of workers
-
-    Args:
-        video_name: Video name of the video that is the basis
-            for the dataset.
-        normalization_data_id: ID of the normalization data that was used for
-            training the model under test.
-
-    Returns:
-        Drone versus Bird dataloader.
-    """
-    dataset = DroneDataset(
-        dataset_name=video_name,
-        data_category_name=names.DataCategoryNames.testing,
-        augment=False,
-        normalization_data_id=normalization_data_id,
-        get_untransformed_function=get_untransformed_uncached_function,
-    )
-    return th.utils.data.DataLoader(
-        dataset,
-        batch_size=settings.BATCH_SIZE_TEST,
-        num_workers=settings.NUM_WORKERS_TEST,
-        collate_fn=batch_to_tuple,
-        pin_memory=True,
-    )
+    sample_image.save(target_path)
 
 
 if __name__ == "__main__":
-    pass
+    DATASET_NAME = names.DatasetNames.optimization_3
+    dl = get_dataloader(
+        dataset_name=DATASET_NAME,
+        data_category_names=[names.DataCategoryNames.training],
+        augment=True,
+    )
+    for i, (images, targets) in tqdm.tqdm(enumerate(dl)):
+        for j, (image, target) in enumerate(zip(images, targets)):
+            save_training_sample(
+                image=image,
+                bounding_boxes=target["boxes"],
+                image_id=target["image_id"],
+                target_path=locations.TEMP_DIR / "dataset_control" / f"{i}_{j}.png",
+            )

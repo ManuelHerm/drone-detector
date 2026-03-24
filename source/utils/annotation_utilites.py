@@ -4,6 +4,7 @@ from pathlib import Path
 
 import skimage
 import torch
+import torchvision
 import tqdm
 from torchvision.io import decode_image
 from torchvision.ops import masks_to_boxes
@@ -20,6 +21,41 @@ log.setLevel(settings.LOG_LEVEL)
 # pylint: disable=no-value-for-parameter
 #         Disabled, because the dbm-function receive the
 #         cursor parameter from the decorator.
+
+
+def fix_one_inspire_annotation_set():
+
+    original_file = (
+        locations.DroneVsBird.annotations / "2019_10_16_C0003_3633_inspire.txt"
+    )
+    new_file = (
+        locations.DroneVsBird.annotations
+        / "own-correction"
+        / "2019_10_16_C0003_3633_inspire.txt"
+    )
+
+    # Read original
+    with open(original_file, mode="r", encoding="utf-8") as f:
+        content = f.readlines()
+
+    # Reformat
+    new_content = []
+    for row in content:
+        row = row.strip()
+        new_content.append(row.split(" "))
+
+    # Shift frame number by offset
+    offset = 15
+    for row_no, row in enumerate(new_content):
+        new_frame = int(row[0]) - offset
+        new_content[row_no][0] = str(new_frame)
+
+    # Remove negative frames
+    del new_content[0:offset]
+
+    # Write new content to disk
+    with open(new_file, mode="w", encoding="utf-8") as nf:
+        nf.writelines([" ".join(row) + "\n" for row in new_content])
 
 
 def parse_dvb_annotations(file: Path) -> list[dt.Annotation]:
@@ -107,15 +143,28 @@ def insert_all_dvb_annotations_into_db():
         dbm.insert_annotations(annotations)
 
 
-def cranfield_seg_mask_to_bbox(mask_path: Path) -> torch.Tensor:
-    # Inspired by:
-    # https://docs.pytorch.org/vision/stable/auto_examples/others/plot_repurposing_annotations.html
-    mask_raw = decode_image(str(mask_path), mode="GRAY")
-    # Mask cleaning: What should be zero, is between 0 and 1.
-    # What should be 1 is between 206 and 207.
-    # Let's draw the line at 100.
-    mask_raw[mask_raw <= 100] = 0
-    mask_raw[mask_raw > 100] = 255
+def seg_mask_to_bbox(mask_path: Path, black_value: int = 100) -> torch.Tensor:
+    """
+    Turn an segmentation mask image into an annotation.
+
+    Inspired by:
+    https://docs.pytorch.org/vision/stable/auto_examples/others/plot_repurposing_annotations.html
+
+    Args:
+        mask_path: Path of the segmentation image.
+        black_value: Every value equal and below `black_value` get turned to 0.
+            All Above becomes 255. This ensures a clear separation between
+            the background and the object to detect.
+            Blender segmentation masks have for background 0 and 1.
+            The object is typically much brighter.
+            For Cranfield datasets, a `black_value` of 100 was used.
+
+    Returns:
+        The bounding boxes as torch.Tensor[N, 4]: bounding boxes
+    """
+    mask_raw = torchvision.io.decode_image(str(mask_path), mode="GRAY")
+    mask_raw[mask_raw <= black_value] = 0
+    mask_raw[mask_raw > black_value] = 255
     # Give connected areas a unique value:
     mask = torch.Tensor(skimage.morphology.label(mask_raw))
     object_ids = torch.unique(mask)
@@ -124,6 +173,61 @@ def cranfield_seg_mask_to_bbox(mask_path: Path) -> torch.Tensor:
     # Move objects into different dimensions
     masks = mask == object_ids[:, None, None]
     # Returning the bounding boxes
+    bboxes = torchvision.ops.masks_to_boxes(masks)
+    return bboxes
+
+
+def seg_mask_to_bbox_color_based(
+    mask_path: Path, black_value: int = 100
+) -> torch.Tensor:
+    """
+    Turn an segmentation mask image into an annotation.
+
+    Each drone has its own color channel.
+
+    Args:
+        mask_path: Path of the segmentation image.
+        black_value: Every value equal and below `black_value` get turned to 0.
+            All Above becomes 255. This ensures a clear separation between
+            the background and the object to detect.
+            Blender segmentation masks have for background 0 and 1.
+            The object is typically much brighter.
+            For Cranfield datasets, a `black_value` of 100 was used.
+
+    Returns:
+        The bounding boxes as torch.Tensor[N, 4]: bounding boxes
+    """
+    mask_image = decode_image(str(mask_path), mode="RGBA")
+
+    # Separate into channels
+    red = mask_image[0]
+    green = mask_image[1]
+    blue = mask_image[2]
+
+    # Turn all black noise into zero values
+    red[red <= black_value] = 0
+    green[green <= black_value] = 0
+    blue[blue <= black_value] = 0
+
+    # Initialize clean mask tensor,
+    # where every item has its own unique value
+    h = int(mask_image.shape[1])
+    w = int(mask_image.shape[2])
+    item_labels = torch.zeros(h, w, dtype=torch.uint8)
+    # Use only the maximum value per color
+    item_labels[(red > green) & (red > blue)] = 1
+    item_labels[(green > red) & (green > blue)] = 2
+    item_labels[(blue > red) & (blue > green)] = 3
+
+    # Getting all numeric labels
+    object_ids = torch.unique(item_labels)
+    # Rejecting background id
+    object_ids = object_ids[1:]
+
+    # Move objects into different dimensions
+    masks = item_labels == object_ids[:, None, None]
+
+    # Getting the bounding boxes
     bboxes = masks_to_boxes(masks)
     return bboxes
 
@@ -148,12 +252,34 @@ def get_image_name_for_cranfield_mask_name(mask_name: str) -> str:
     return f"Image{image_number}.jpg"
 
 
-def get_annotations_from_cranfield_segmentation_mask(
-    mask_path: Path,
+def get_annotations_from_segmentation_mask(
+    image_id: int, mask_path: Path, mask_mode: str, black_value: int
 ) -> list[dt.Annotation]:
-    boxes = cranfield_seg_mask_to_bbox(mask_path)
-    image_name = get_image_name_for_cranfield_mask_name(str(mask_path.name))
-    image_id = dbm.get_image_id_for_image_name(image_name)
+    """
+    Turn segmentation mask image into bounding box definitions.
+
+    Args:
+        image_id: The id of the image that belongs to the annotations.
+        mask_path: The location of the mask image.
+        mask_mode: Options are:
+            - "cluster": All drones are shown in white and clusters of
+                white pixels are grouped to form a bounding box.
+            - "color_based": Each drone is shown in either green, red,
+                or blue. Hence, there can a maximum of three drones
+                in the image.
+        black_value: Everything below this value is treated as background.
+
+    """
+    if mask_mode == "cluster":
+        boxes = seg_mask_to_bbox(mask_path=mask_path, black_value=black_value)
+    elif mask_mode == "color_based":
+        boxes = seg_mask_to_bbox_color_based(
+            mask_path=mask_path, black_value=black_value
+        )
+    else:
+        raise ValueError(
+            f"Unknown mode provided for mask conversion to bounding box: {mask_mode}"
+        )
     annotations = [
         dt.Annotation(
             image_id=image_id,
@@ -230,4 +356,4 @@ def write_images_with_broken_annotation_to_disk(target_folder: Path):
 
 
 if __name__ == "__main__":
-    broken = find_broken_annotations()
+    seg_mask_to_bbox_color_based(locations.TEMP_DIR / "problem.png", black_value=100)

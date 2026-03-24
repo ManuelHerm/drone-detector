@@ -43,6 +43,11 @@ class ConvergenceMonitor:
             "validation", scalars, global_step=self.number_of_samples
         )
 
+    def add_dvb_ap05_per_epoch(self, dvb_ap05: dict[str, float]):
+        self.writer.add_scalars(
+            "drone_vs_bird", dvb_ap05, global_step=self.number_of_samples
+        )
+
     @staticmethod
     def _init_loss_df():
         return pd.DataFrame(
